@@ -25,6 +25,13 @@ obj-$(CONFIG_SND_SOC_WCD_MBHC)  += snd-soc-wcd-mbhc.o
 obj-$(CONFIG_SND_SOC_WSA881X)	+= snd-soc-wsa881x.o
 obj-$(CONFIG_SND_SOC_WCD_SPI)  += snd-soc-wcd-spi.o
 
+snd-soc-max98927-objs := max98927.o
+obj-$(CONFIG_SND_SOC_MAX98927) += snd-soc-max98927.o
+
+snd-soc-cs35l36-objs := cs35l36.o cs35l36-tables.o
+obj-$(CONFIG_SND_SOC_CS35L36)  += snd-soc-cs35l36.o
+
+
 snd-soc-msm-stub-objs := msm_stub.o
 obj-$(CONFIG_SND_SOC_MSM_STUB)  += snd-soc-msm-stub.o
 
@@ -40,4 +47,3 @@ obj-$(CONFIG_WCD9XXX_CODEC_CORE) += wcd-core.o
 obj-$(CONFIG_SND_SOC_MSM_HDMI_CODEC_RX) += msm_hdmi_codec_rx.o
 obj-$(CONFIG_SND_SOC_RT5514) += rt5514.o rl6231.o
 obj-$(CONFIG_SND_SOC_RT5514_SPI) += rt5514-spi.o
-obj-$(CONFIG_SND_SOC_CS35L36) += cs35l36.o cs35l36-tables.o

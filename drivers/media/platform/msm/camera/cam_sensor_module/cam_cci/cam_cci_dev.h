@@ -1,4 +1,4 @@
-/* Copyright (c) 2017-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2017-2018, 2020 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -45,7 +45,12 @@
 #define CYCLES_PER_MICRO_SEC_DEFAULT 4915
 #define CCI_MAX_DELAY 1000000
 
+#ifdef CONFIG_BOARD_B1C1
+#define CCI_TIMEOUT msecs_to_jiffies(50)
+#else
+/* pa/1230314 msm: camera: b4s4: update CCI time-out period */
 #define CCI_TIMEOUT msecs_to_jiffies(200)
+#endif
 
 #define NUM_MASTERS 2
 #define NUM_QUEUES 2
@@ -300,6 +305,6 @@ static inline struct v4l2_subdev *cam_cci_get_subdev(void)
 #endif
 
 #define VIDIOC_MSM_CCI_CFG \
-	_IOWR('V', BASE_VIDIOC_PRIVATE + 23, struct cam_cci_ctrl *)
+	_IOWR('V', BASE_VIDIOC_PRIVATE + 23, struct cam_cci_ctrl)
 
 #endif /* _CAM_CCI_DEV_H_ */

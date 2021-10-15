@@ -37,7 +37,6 @@
 #include <linux/uio.h>
 #include <linux/atomic.h>
 #include <linux/prefetch.h>
-#define __FS_HAS_ENCRYPTION IS_ENABLED(CONFIG_F2FS_FS_ENCRYPTION)
 #include <linux/fscrypt.h>
 
 /*
@@ -280,8 +279,8 @@ static ssize_t dio_complete(struct dio *dio, ssize_t ret, bool is_async)
 		 */
 		dio->iocb->ki_pos += transferred;
 
-		if (dio->op == REQ_OP_WRITE)
-			ret = generic_write_sync(dio->iocb,  transferred);
+		if (ret > 0 && dio->op == REQ_OP_WRITE)
+			ret = generic_write_sync(dio->iocb, ret);
 		dio->iocb->ki_complete(dio->iocb, ret, 0);
 	}
 
@@ -367,6 +366,12 @@ void dio_end_io(struct bio *bio, int error)
 }
 EXPORT_SYMBOL_GPL(dio_end_io);
 
+static inline bool dio_fstype_sets_dun(struct dio *dio)
+{
+	return IS_ENABLED(CONFIG_PFK) &&
+	       strcmp(dio->inode->i_sb->s_type->name, "f2fs") == 0;
+}
+
 static inline void
 dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
 	      struct block_device *bdev,
@@ -380,6 +385,14 @@ dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
 	 */
 	bio = bio_alloc(GFP_KERNEL, nr_vecs);
 
+#ifdef CONFIG_PFK
+	bio->bi_dio_inode = dio->inode;
+	if (dio_fstype_sets_dun(dio))
+		fscrypt_set_bio_crypt_ctx(bio, dio->inode,
+			sdio->cur_page_fs_offset >> dio->inode->i_blkbits,
+			GFP_KERNEL);
+#endif
+
 	bio->bi_bdev = bdev;
 	bio->bi_iter.bi_sector = first_sector;
 	bio_set_op_attrs(bio, dio->op, dio->op_flags);
@@ -391,23 +404,6 @@ dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
 	sdio->bio = bio;
 	sdio->logical_offset_in_bio = sdio->cur_page_fs_offset;
 }
-
-#ifdef CONFIG_PFK
-static bool is_inode_filesystem_type(const struct inode *inode,
-					const char *fs_type)
-{
-	if (!inode || !fs_type)
-		return false;
-
-	if (!inode->i_sb)
-		return false;
-
-	if (!inode->i_sb->s_type)
-		return false;
-
-	return (strcmp(inode->i_sb->s_type->name, fs_type) == 0);
-}
-#endif
 
 /*
  * In the AIO read case we speculatively dirty the pages before starting IO.
@@ -430,17 +426,6 @@ static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
 	if (dio->is_async && dio->op == REQ_OP_READ && dio->should_dirty)
 		bio_set_pages_dirty(bio);
 
-#ifdef CONFIG_PFK
-	bio->bi_dio_inode = dio->inode;
-
-/* iv sector for security/pfe/pfk_fscrypt.c and f2fs in fs/f2fs/f2fs.h.*/
-#define PG_DUN_NEW(i,p)                                            \
-	(((((u64)(i)->i_ino) & 0xffffffff) << 32) | ((p) & 0xffffffff))
-
-	if (is_inode_filesystem_type(dio->inode, "f2fs"))
-		fscrypt_set_ice_dun(dio->inode, bio, PG_DUN_NEW(dio->inode,
-			(sdio->logical_offset_in_bio >> PAGE_SHIFT)));
-#endif
 	dio->bio_bdev = bio->bi_bdev;
 
 	if (sdio->submit_io) {
@@ -661,6 +646,7 @@ static int get_more_blocks(struct dio *dio, struct dio_submit *sdio,
 	unsigned long fs_count;	/* Number of filesystem-sized blocks */
 	int create;
 	unsigned int i_blkbits = sdio->blkbits + sdio->blkfactor;
+	loff_t i_size;
 
 	/*
 	 * If there was a memory error and we've overwritten all the
@@ -690,8 +676,8 @@ static int get_more_blocks(struct dio *dio, struct dio_submit *sdio,
 		 */
 		create = dio->op == REQ_OP_WRITE;
 		if (dio->flags & DIO_SKIP_HOLES) {
-			if (fs_startblk <= ((i_size_read(dio->inode) - 1) >>
-							i_blkbits))
+			i_size = i_size_read(dio->inode);
+			if (i_size && fs_startblk <= (i_size - 1) >> i_blkbits)
 				create = 0;
 		}
 
@@ -790,9 +776,20 @@ static inline int dio_send_cur_page(struct dio *dio, struct dio_submit *sdio,
 		 * current logical offset in the file does not equal what would
 		 * be the next logical offset in the bio, submit the bio we
 		 * have.
+		 *
+		 * When fscrypt inline encryption is used, DUN (data unit
+		 * number) contiguity is also required.  Normally that's implied
+		 * by logical contiguity.  But with the IV_INO_LBLK_32 IV
+		 * generation method, the DUN may wrap from 0xffffffff to 0 in
+		 * logically contiguous blocks.  So we must explicitly check
+		 * fscrypt_mergeable_bio() too.
 		 */
 		if (sdio->final_block_in_bio != sdio->cur_page_block ||
-		    cur_offset != bio_next_offset)
+		    cur_offset != bio_next_offset ||
+		    (dio_fstype_sets_dun(dio) &&
+		     !fscrypt_mergeable_bio(sdio->bio, dio->inode,
+					    cur_offset >>
+					    dio->inode->i_blkbits)))
 			dio_bio_submit(dio, sdio);
 	}
 

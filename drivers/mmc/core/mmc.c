@@ -29,6 +29,7 @@
 #include "sd_ops.h"
 
 #define DEFAULT_CMD6_TIMEOUT_MS	500
+#define MIN_CACHE_EN_TIMEOUT_MS 1600
 
 static const unsigned int tran_exp[] = {
 	10000,		100000,		1000000,	10000000,
@@ -554,9 +555,7 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
 			card->cid.year += 16;
 
 		/* check whether the eMMC card supports BKOPS */
-		if (!mmc_card_broken_hpi(card) &&
-		    (ext_csd[EXT_CSD_BKOPS_SUPPORT] & 0x1) &&
-				card->ext_csd.hpi) {
+		if (ext_csd[EXT_CSD_BKOPS_SUPPORT] & 0x1) {
 			card->ext_csd.bkops = 1;
 			card->ext_csd.bkops_en = ext_csd[EXT_CSD_BKOPS_EN];
 			card->ext_csd.raw_bkops_status =
@@ -888,6 +887,68 @@ static ssize_t mmc_dsr_show(struct device *dev,
 
 static DEVICE_ATTR(dsr, S_IRUGO, mmc_dsr_show, NULL);
 
+static ssize_t mmc_model_show(struct device *dev,
+			    struct device_attribute *attr,
+			    char *buf)
+{
+	struct mmc_card *card = mmc_dev_to_card(dev);
+	char model_names[32];
+
+	if (!strncmp(card->cid.prod_name, "DD6DMB", 6))
+		strlcpy(model_names, "KMDD6001DM-B320", sizeof(model_names));
+	else if (!strncmp(card->cid.prod_name, "DH6DAB", 6))
+		strlcpy(model_names, "KMDH6001DA-B422", sizeof(model_names));
+	else if (!strncmp(card->cid.prod_name, "hB8aP>", 6))
+		strlcpy(model_names, "H9HP27ACPMMDAR-KMM", sizeof(model_names));
+	else if (!strncmp(card->cid.prod_name, "hC8aP>", 6))
+		strlcpy(model_names, "H9HP52ACPMADAR-KMM", sizeof(model_names));
+	else if (!strncmp(card->cid.prod_name, "S0J9K8", 6))
+		strlcpy(model_names, "MT29VZZZAD8DQKSL-046 W.9K8",
+				sizeof(model_names));
+	else
+		strlcpy(model_names, "UNKNOWN", sizeof(model_names));
+
+	return snprintf(buf, sizeof(model_names), "%s\n", model_names);
+}
+
+static DEVICE_ATTR(model, 0444, mmc_model_show, NULL);
+
+static ssize_t mmc_vendor_show(struct device *dev,
+			    struct device_attribute *attr,
+			    char *buf)
+{
+	struct mmc_card *card = mmc_dev_to_card(dev);
+	char vendor_names[16];
+
+	switch (card->cid.manfid) {
+	case CID_MANFID_SANDISK:
+		strlcpy(vendor_names, "SANDISK", sizeof(vendor_names));
+		break;
+	case CID_MANFID_TOSHIBA:
+		strlcpy(vendor_names, "TOSHIBA", sizeof(vendor_names));
+		break;
+	case CID_MANFID_MICRON:
+		strlcpy(vendor_names, "MICRON", sizeof(vendor_names));
+		break;
+	case CID_MANFID_SAMSUNG:
+		strlcpy(vendor_names, "SAMSUNG", sizeof(vendor_names));
+		break;
+	case CID_MANFID_KINGSTON:
+		strlcpy(vendor_names, "KINGSTON", sizeof(vendor_names));
+		break;
+	case CID_MANFID_HYNIX:
+		strlcpy(vendor_names, "SKhynix", sizeof(vendor_names));
+		break;
+	default:
+		strlcpy(vendor_names, "UNKNOWN", sizeof(vendor_names));
+		break;
+	}
+
+	return snprintf(buf, sizeof(vendor_names), "%s\n", vendor_names);
+}
+
+static DEVICE_ATTR(vendor, 0444, mmc_vendor_show, NULL);
+
 static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_cid.attr,
 	&dev_attr_csd.attr,
@@ -912,6 +973,8 @@ static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_rel_sectors.attr,
 	&dev_attr_ocr.attr,
 	&dev_attr_dsr.attr,
+	&dev_attr_model.attr,
+	&dev_attr_vendor.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mmc_std);
@@ -2198,23 +2261,27 @@ reinit:
 		if (err) {
 			pr_warn("%s: Enabling HPI failed\n",
 				mmc_hostname(card->host));
+			card->ext_csd.hpi_en = 0;
 			err = 0;
-		} else
+		} else {
 			card->ext_csd.hpi_en = 1;
+		}
 	}
 
 	/*
-	 * If cache size is higher than 0, this indicates
-	 * the existence of cache and it can be turned on.
-	 * If HPI is not supported then cache shouldn't be enabled.
+	 * If cache size is higher than 0, this indicates the existence of cache
+	 * and it can be turned on. Note that some eMMCs from Micron has been
+	 * reported to need ~800 ms timeout, while enabling the cache after
+	 * sudden power failure tests. Let's extend the timeout to a minimum of
+	 * DEFAULT_CACHE_EN_TIMEOUT_MS and do it for all cards.
 	 */
-	if (!mmc_card_broken_hpi(card) &&
-	    card->ext_csd.cache_size > 0) {
-		if (card->ext_csd.hpi_en &&
-			(!(card->quirks & MMC_QUIRK_CACHE_DISABLE))) {
+	if (card->ext_csd.cache_size > 0) {
+		unsigned int timeout_ms = MIN_CACHE_EN_TIMEOUT_MS;
+
+		timeout_ms = max(card->ext_csd.generic_cmd6_time, timeout_ms);
+		if (!(card->quirks & MMC_QUIRK_CACHE_DISABLE)) {
 			err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
-					EXT_CSD_CACHE_CTRL, 1,
-					card->ext_csd.generic_cmd6_time);
+					EXT_CSD_CACHE_CTRL, 1, timeout_ms);
 			if (err && err != -EBADMSG) {
 				pr_err("%s: %s: fail on CACHE_CTRL ON %d\n",
 					mmc_hostname(host), __func__, err);
@@ -2232,12 +2299,12 @@ reinit:
 			} else {
 				card->ext_csd.cache_ctrl = 1;
 			}
+
 			/* enable cache barrier if supported by the device */
 			if (card->ext_csd.cache_ctrl &&
 					card->ext_csd.barrier_support) {
 				err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
-					EXT_CSD_BARRIER_CTRL, 1,
-					card->ext_csd.generic_cmd6_time);
+					EXT_CSD_BARRIER_CTRL, 1, timeout_ms);
 				if (err && err != -EBADMSG) {
 					pr_err("%s: %s: mmc_switch() for BARRIER_CTRL fails %d\n",
 						mmc_hostname(host), __func__,
@@ -2263,8 +2330,7 @@ reinit:
 			 * we want to avoid cache.
 			 */
 			err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
-					EXT_CSD_CACHE_CTRL, 0,
-					card->ext_csd.generic_cmd6_time);
+					EXT_CSD_CACHE_CTRL, 0, timeout_ms);
 			if (err) {
 				pr_err("%s: %s: fail on CACHE_CTRL OFF %d\n",
 					mmc_hostname(host), __func__, err);
@@ -2272,6 +2338,7 @@ reinit:
 			}
 		}
 	}
+
 	/*
 	 * The mandatory minimum values are defined for packed command.
 	 * read: 5, write: 3

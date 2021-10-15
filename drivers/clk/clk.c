@@ -1144,7 +1144,7 @@ static int clk_core_round_rate_nolock(struct clk_core *core,
 	struct clk_core *parent;
 	long rate;
 
-	lockdep_assert_held(&prepare_lock);
+	// lockdep_assert_held(&prepare_lock);
 
 	if (!core)
 		return 0;
@@ -3273,11 +3273,17 @@ static int __clk_core_init(struct clk_core *core)
 	if (core->flags & CLK_IS_CRITICAL) {
 		unsigned long flags;
 
-		clk_core_prepare(core);
+		ret = clk_core_prepare(core);
+		if (ret)
+			goto out;
 
 		flags = clk_enable_lock();
-		clk_core_enable(core);
+		ret = clk_core_enable(core);
 		clk_enable_unlock(flags);
+		if (ret) {
+			clk_core_unprepare(core);
+			goto out;
+		}
 	}
 
 	/*

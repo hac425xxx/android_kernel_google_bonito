@@ -23,6 +23,7 @@
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/clock/mdss-10nm-pll-clk.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/msm/power-on.h>
 
 #include "../qcom/sdm670-pmic-overlay.dtsi"
 #include "sdm670-b4s4-display.dtsi"
@@ -43,18 +44,7 @@
 };
 
 &android_fstab {
-	vendor {
-		dev = "/dev/block/platform/soc/7c4000.sdhci/by-name/vendor";
-	};
-
-	persist {
-		compatible = "android,persist";
-		dev = "/dev/block/platform/soc/7c4000.sdhci/by-name/persist";
-		mnt_point = "/mnt/vendor/persist";
-		type = "ext4";
-		mnt_flags = "nosuid,nodev,noatime,barrier=1";
-		fsmgr_flags = "wait";
-	};
+	status = "disabled";
 };
 
 &qupv3_se10_i2c {
@@ -324,10 +314,6 @@
 	interrupt-names = "kpdpwr", "resin", "kpdpwr-bark",
 			"resin-bark", "kpdpwr-resin-bark";
 	qcom,pon_1 {
-		qcom,support-reset = <1>;
-		qcom,s1-timer = <10256>;
-		qcom,s2-timer = <2000>;
-		qcom,s2-type = <1>;
 		qcom,use-bark;
 	};
 	qcom,pon_2 {
@@ -338,7 +324,12 @@
 		qcom,support-reset = <1>;
 		qcom,s1-timer = <10256>;
 		qcom,s2-timer = <2000>;
-		qcom,s2-type = <8>;
+		qcom,s2-type = <PON_POWER_OFF_DVDD_HARD_RESET>;
 		qcom,pull-up = <1>;
 	};
+};
+
+// Force warm reboot on 'shutdown,thermal'
+&msm_poweroff {
+	qcom,force-warm-reboot-on-thermal-shutdown;
 };

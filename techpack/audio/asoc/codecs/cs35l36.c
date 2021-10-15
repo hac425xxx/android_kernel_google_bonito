@@ -41,7 +41,7 @@
 #include "cs35l36.h"
 
 #ifdef CONFIG_CIRRUS_SPKR_PROTECTION
-#include <dsp/msm-cirrus-playback.h>
+#include <asoc/msm-cirrus-playback.h>
 #endif
 /*
  * Some fields take zero as a valid value so use a high bit flag that won't
@@ -205,6 +205,32 @@ static int cs35l36_main_amp_event(struct snd_soc_dapm_widget *w,
 					1 << CS35L36_AMP_MUTE_SHIFT);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
+		regmap_update_bits(cs35l36->regmap, CS35L36_PWR_CTRL1,
+					CS35L36_GLOBAL_EN_MASK,
+					0 << CS35L36_GLOBAL_EN_SHIFT);
+		usleep_range(2000, 2100);
+		break;
+	default:
+		dev_dbg(codec->dev, "Invalid event = 0x%x\n", event);
+	}
+	return ret;
+}
+
+static int cs35l36_boost_event(struct snd_soc_dapm_widget *w,
+		struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
+	struct cs35l36_private *cs35l36 = snd_soc_codec_get_drvdata(codec);
+
+	switch (event) {
+	case SND_SOC_DAPM_POST_PMU:
+		if (!cs35l36->pdata.extern_boost)
+			regmap_update_bits(cs35l36->regmap, CS35L36_PWR_CTRL2,
+						CS35L36_BST_EN_MASK,
+						CS35L36_BST_EN <<
+						CS35L36_BST_EN_SHIFT);
+		break;
+	case SND_SOC_DAPM_POST_PMD:
 		if (!cs35l36->pdata.extern_boost)
 			regmap_update_bits(cs35l36->regmap, CS35L36_PWR_CTRL2,
 						CS35L36_BST_EN_MASK,
@@ -219,7 +245,7 @@ static int cs35l36_main_amp_event(struct snd_soc_dapm_widget *w,
 	default:
 		dev_dbg(codec->dev, "Invalid event = 0x%x\n", event);
 	}
-	return ret;
+	return 0;
 }
 
 static const char * const cs35l36_chan_text[] = {
@@ -234,8 +260,21 @@ static const struct snd_kcontrol_new cs35l36_chan_mux[] = {
 	SOC_DAPM_ENUM("Input Mux", chansel_enum),
 };
 
+static const char * const cs35l36_boost_text[] = {
+	"On",
+	"Off",
+};
+
+static SOC_ENUM_SINGLE_DECL(boost_enum, SND_SOC_NOPM, 0,
+		cs35l36_boost_text);
+
+static const struct snd_kcontrol_new cs35l36_boost_mux[] = {
+	SOC_DAPM_ENUM("Boost Enable", boost_enum),
+};
+
 static const struct snd_kcontrol_new amp_enable_ctrl =
-		SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0);
+	SOC_DAPM_SINGLE_AUTODISABLE("Switch", CS35L36_AMP_OUT_MUTE,
+					CS35L36_AMP_MUTE_SHIFT, 1, 1);
 
 static const char * const asp_tx_src_text[] = {
 	"Zero Fill", "ASPRX1", "VMON", "IMON",
@@ -312,6 +351,10 @@ static const struct snd_soc_dapm_widget cs35l36_dapm_widgets[] = {
 
 	SND_SOC_DAPM_OUTPUT("SPK"),
 	SND_SOC_DAPM_SWITCH("AMP Enable", SND_SOC_NOPM, 0, 1, &amp_enable_ctrl),
+	SND_SOC_DAPM_MIXER("CLASS H", CS35L36_PWR_CTRL3, 4, 0, NULL, 0),
+	SND_SOC_DAPM_MUX_E("BOOST Mux", SND_SOC_NOPM, 0, 0, cs35l36_boost_mux,
+		cs35l36_boost_event, SND_SOC_DAPM_POST_PMD |
+				SND_SOC_DAPM_POST_PMU),
 
 	SND_SOC_DAPM_AIF_OUT("ASPTX1", NULL, 0, CS35L36_ASP_RX_TX_EN, 0, 0),
 	SND_SOC_DAPM_AIF_OUT("ASPTX2", NULL, 1, CS35L36_ASP_RX_TX_EN, 1, 0),
@@ -393,6 +436,9 @@ static const struct snd_soc_dapm_route cs35l36_audio_map[] = {
 	{"SDIN", NULL, "AMP Enable"},
 	{"Channel Mux", "RX1", "SDIN"},
 	{"Channel Mux", "RX2", "SDIN"},
+	{"BOOST Mux", "On", "Channel Mux"},
+	{"CLASS H", NULL, "BOOST Mux"},
+	{"Main AMP", NULL, "Channel Mux"},
 	{"CLASS H", NULL, "SDIN"},
 	{"Main AMP", NULL, "CLASS H"},
 	{"SPK", NULL, "Main AMP"},
@@ -1189,6 +1235,14 @@ static int cs35l36_handle_of_data(struct i2c_client *i2c_client,
 			return -EINVAL;
 		}
 
+		// see SPEC 7.11.3 BST_IPK_CTL
+		// The transformation between reg value to current:
+		// bst_ipk    current
+		// 16         1.60 A
+		// 17         1.65 A
+		// ...
+		// 74         4.50 A
+		// The reg value must have an offset 16 for the minimum
 		pdata->bst_ipk = (val - 1600) / 50 + 16;
 	}
 

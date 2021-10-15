@@ -21,6 +21,11 @@
 #include <linux/list_sort.h>
 #include <video/mipi_display.h>
 
+#include <dsi_drm.h>
+#include <sde_crtc.h>
+#include <sde_encoder.h>
+
+#include "dsi_display.h"
 #include "dsi_panel.h"
 
 #define BL_NODE_NAME_SIZE 32
@@ -28,6 +33,66 @@
 #define BL_STATE_STANDBY	BL_CORE_FBBLANK
 #define BL_STATE_LP		BL_CORE_DRIVER1
 #define BL_STATE_LP2		BL_CORE_DRIVER2
+#define BL_HBM 			1023
+
+bool backlight_dimmer = 0;
+module_param(backlight_dimmer, bool, 0644);
+
+static int hbm_enable = 0;
+static struct dsi_backlight_config *bl_g;
+static struct device *fb0_device;
+
+static void enable_hbm(int enable)
+{
+	struct dsi_panel *panel = container_of(bl_g, struct dsi_panel, bl_config);
+	struct hbm_data *hbm = bl_g->hbm;
+	struct hbm_range *range = NULL;
+	u32 target_range = enable ? bl_g->hbm->num_ranges - 1 : 0;
+	range = hbm->ranges + target_range;
+
+	if(dsi_panel_cmd_set_transfer(panel, &range->entry_cmd))
+		pr_err("Failed to send command for range %d\n",	enable);
+}
+
+static ssize_t hbm_show(struct device *device, struct device_attribute *attr,
+		      char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", hbm_enable);
+}
+
+static ssize_t hbm_store(struct device *device, struct device_attribute *attr,
+		       const char *buf, size_t count)
+{
+	int ret, val;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	if (val < 0 || val > 1)
+		val = 0;
+
+	hbm_enable = val;
+	enable_hbm(hbm_enable);
+	backlight_update_status(bl_g->bl_device);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(hbm);
+
+static void fb0_init_device(struct dsi_backlight_config *bl)
+{
+	bl_g = bl;
+	fb0_device = device_create(fb_class, NULL, MKDEV(0, 0), NULL, "fb0");
+	if (IS_ERR(fb0_device)) {
+		fb0_device = NULL;
+		return;
+	}
+
+	if (device_create_file(fb0_device, &dev_attr_hbm))
+		pr_warn("unable to create hbm node\n");
+}
 
 struct dsi_backlight_pwm_config {
 	bool pwm_pmi_control;
@@ -37,7 +102,7 @@ struct dsi_backlight_pwm_config {
 };
 
 static void dsi_panel_bl_hbm_free(struct device *dev,
-	struct hbm_data **hbm_data);
+	struct dsi_backlight_config *bl);
 
 static inline bool is_standby_mode(unsigned long state)
 {
@@ -130,7 +195,7 @@ static u32 dsi_backlight_calculate_normal(struct dsi_backlight_config *bl,
 		/* map UI brightness into driver backlight level rounding it */
 		rc = dsi_backlight_lerp(
 			1, bl->brightness_max_level,
-			bl->bl_min_level ? : 1, bl->bl_max_level,
+			backlight_dimmer ? 3 : bl->bl_min_level, bl->bl_max_level,
 			brightness, &bl_lvl);
 		if (unlikely(rc))
 			pr_err("failed to linearly interpolate, brightness unmodified\n");
@@ -139,6 +204,158 @@ static u32 dsi_backlight_calculate_normal(struct dsi_backlight_config *bl,
 	pr_debug("normal bl: bl_lut %sused\n", bl->lut ? "" : "un");
 
 	return bl_lvl;
+}
+
+int dsi_backlight_hbm_dimming_start(struct dsi_backlight_config *bl,
+	u32 num_frames, struct dsi_panel_cmd_set *stop_cmd)
+{
+	struct hbm_data *hbm = bl->hbm;
+
+	if (!hbm || !num_frames)
+		return 0;
+
+	if (unlikely(!hbm->dimming_workq)) {
+		pr_err("hbm: tried to start dimming, but missing worker thread\n");
+		return -EINVAL;
+	}
+
+	if (!hbm->dimming_active) {
+		struct dsi_display *display =
+			dev_get_drvdata(hbm->panel->parent);
+		int rc;
+
+		if (likely(display->bridge &&
+			display->bridge->base.encoder &&
+			display->bridge->base.encoder->crtc)) {
+			rc = drm_crtc_vblank_get(
+				display->bridge->base.encoder->crtc);
+		} else {
+			pr_err("hbm: missing CRTC during dimming start.\n");
+			return -EINVAL;
+		}
+
+		if (rc) {
+			pr_err("hbm: failed DRM request to get vblank\n: %d",
+				rc);
+			return rc;
+		}
+	}
+
+	hbm->dimming_frames_total = num_frames;
+	hbm->dimming_frames_left = num_frames;
+	hbm->dimming_stop_cmd = stop_cmd;
+	hbm->dimming_active = true;
+
+	pr_debug("HBM dimming starting\n");
+	queue_work(hbm->dimming_workq, &hbm->dimming_work);
+
+	return 0;
+}
+
+void dsi_backlight_hbm_dimming_stop(struct dsi_backlight_config *bl)
+{
+	struct dsi_display *display;
+	struct hbm_data *hbm = bl->hbm;
+
+	if (!hbm || !hbm->dimming_active)
+		return;
+
+	display = dev_get_drvdata(hbm->panel->parent);
+	if (likely(display->bridge &&
+		display->bridge->base.encoder &&
+		display->bridge->base.encoder->crtc)) {
+		drm_crtc_vblank_put(display->bridge->base.encoder->crtc);
+	} else {
+		pr_err("hbm: missing CRTC during dimming end.\n");
+	}
+
+	if (hbm->dimming_stop_cmd) {
+		int rc = dsi_panel_cmd_set_transfer(hbm->panel,
+			hbm->dimming_stop_cmd);
+
+		if (rc)
+			pr_err("hbm: failed to disable brightness dimming.\n");
+	}
+
+	hbm->dimming_frames_total = 0;
+	hbm->dimming_frames_left = 0;
+	hbm->dimming_stop_cmd = NULL;
+	hbm->dimming_active = false;
+	pr_debug("HBM dimming stopped\n");
+}
+
+static void dsi_backlight_hbm_dimming_restart(struct dsi_backlight_config *bl)
+{
+	struct hbm_data *hbm = bl->hbm;
+
+	if (!hbm || !hbm->dimming_active)
+		return;
+
+	hbm->dimming_frames_left = hbm->dimming_frames_total;
+	pr_debug("hbm: dimming restarted\n");
+}
+
+static int dsi_backlight_hbm_wait_frame(struct hbm_data *hbm)
+{
+	struct dsi_display *display = dev_get_drvdata(hbm->panel->parent);
+
+	if (likely(display->bridge && display->bridge->base.encoder)) {
+		int rc = sde_encoder_wait_for_event(
+			display->bridge->base.encoder, MSM_ENC_VBLANK);
+		if (rc)
+			return rc;
+	} else {
+		pr_err("hbm: missing SDE encoder, can't wait for vblank\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void dsi_backlight_hbm_dimming_work(struct work_struct *work)
+{
+	struct dsi_panel *panel;
+	struct hbm_data *hbm =
+		container_of(work, struct hbm_data, dimming_work);
+
+	if (!hbm)
+		return;
+
+	panel = hbm->panel;
+	while (hbm->dimming_active) {
+		int rc = dsi_backlight_hbm_wait_frame(hbm);
+
+		/*
+		 * It's possible that this thread is running while the driver is
+		 * attempting to shut down. If this is the case, the driver
+		 * will signal for dimming to stop while holding panel_lock.
+		 * So if we fail to acquire the lock, wait a bit, then check the
+		 * state of dimming_active again.
+		 */
+		if (!mutex_trylock(&panel->panel_lock)) {
+			usleep_range(1000, 2000);
+			continue;
+		}
+
+		pr_debug("hbm: dimming waited on frame %d of %d\n",
+			hbm->dimming_frames_left, hbm->dimming_frames_total);
+		if (!hbm->dimming_active) {
+			mutex_unlock(&panel->panel_lock);
+			break;
+		}
+
+		if (rc) {
+			pr_err("hbm: failed to wait for vblank, disabling dimming now\n");
+			hbm->dimming_frames_left = 0;
+		} else if (hbm->dimming_frames_left > 0) {
+			hbm->dimming_frames_left--;
+		}
+
+		if (!hbm->dimming_frames_left)
+			dsi_backlight_hbm_dimming_stop(&panel->bl_config);
+
+		mutex_unlock(&panel->panel_lock);
+	}
 }
 
 int dsi_backlight_hbm_find_range(struct dsi_backlight_config *bl,
@@ -184,12 +401,15 @@ static u32 dsi_backlight_calculate_hbm(struct dsi_backlight_config *bl,
 
 	range = hbm->ranges + target_range;
 	if (hbm->cur_range != target_range) {
-		rc = dsi_panel_cmd_set_transfer(panel, &range->dsi_cmd);
+		rc = dsi_panel_cmd_set_transfer(panel, &range->entry_cmd);
 		if (rc) {
 			pr_err("Failed to send command for range %d\n",
 				target_range);
 			return bl->bl_actual;
 		}
+
+		dsi_backlight_hbm_dimming_start(bl, range->num_dimming_frames,
+			&range->dimming_stop_cmd);
 		pr_info("hbm: range %d -> %d\n", hbm->cur_range, target_range);
 		hbm->cur_range = target_range;
 	}
@@ -225,6 +445,10 @@ static u32 dsi_backlight_calculate(struct dsi_backlight_config *bl,
 	bl_temp = mult_frac(bl_temp, bl->bl_scale_ad,
 			MAX_AD_BL_SCALE_LEVEL);
 
+	if (hbm_enable) {
+		return BL_HBM;
+	}
+
 	if (panel->hbm_mode)
 		bl_lvl = dsi_backlight_calculate_hbm(bl, bl_temp);
 	else
@@ -245,14 +469,17 @@ static int dsi_backlight_update_status(struct backlight_device *bd)
 	int bl_lvl;
 	int rc = 0;
 
+	mutex_lock(&panel->panel_lock);
+	mutex_lock(&bl->state_lock);
 	if ((bd->props.state & (BL_CORE_FBBLANK | BL_CORE_SUSPENDED)) ||
 			(bd->props.power != FB_BLANK_UNBLANK))
 		brightness = 0;
 
-	mutex_lock(&panel->panel_lock);
 	bl_lvl = dsi_backlight_calculate(bl, brightness);
 	if (bl_lvl == bl->bl_actual && bl->last_state == bd->props.state)
 		goto done;
+
+	dsi_backlight_hbm_dimming_restart(bl);
 
 	if (dsi_panel_initialized(panel) && bl->update_bl) {
 		/* VR brightness is set as part of the VR entry sequence.
@@ -277,6 +504,7 @@ static int dsi_backlight_update_status(struct backlight_device *bd)
 	bl->last_state = bd->props.state;
 
 done:
+	mutex_unlock(&bl->state_lock);
 	mutex_unlock(&panel->panel_lock);
 	return rc;
 }
@@ -547,6 +775,9 @@ static int dsi_backlight_register(struct dsi_backlight_config *bl)
 	if (sysfs_create_groups(&bl->bl_device->dev.kobj, bl_device_groups))
 		pr_warn("unable to create device groups\n");
 
+	//make dummy fb0 device so we have the old standard hbm sysfs path
+	fb0_init_device(bl);
+
 	reg = regulator_get(panel->parent, "lab");
 	if (!PTR_ERR_OR_ZERO(reg)) {
 		pr_info("LAB regulator found\n");
@@ -594,7 +825,7 @@ int dsi_backlight_early_dpms(struct dsi_backlight_config *bl, int power_mode)
 
 	pr_info("power_mode:%d state:0x%0x\n", power_mode, bd->props.state);
 
-	mutex_lock(&bd->ops_lock);
+	mutex_lock(&bl->state_lock);
 	state = get_state_after_dpms(bl, power_mode);
 
 	if (bl->lab_vreg) {
@@ -604,8 +835,7 @@ int dsi_backlight_early_dpms(struct dsi_backlight_config *bl, int power_mode)
 		if (last_mode != mode)
 			regulator_set_mode(bl->lab_vreg, mode);
 	}
-
-	mutex_unlock(&bd->ops_lock);
+	mutex_unlock(&bl->state_lock);
 
 	return 0;
 }
@@ -620,15 +850,15 @@ int dsi_backlight_late_dpms(struct dsi_backlight_config *bl, int power_mode)
 
 	pr_debug("power_mode:%d state:0x%0x\n", power_mode, bd->props.state);
 
-	mutex_lock(&bd->ops_lock);
+	mutex_lock(&bl->state_lock);
 	state = get_state_after_dpms(bl, power_mode);
 
 	bd->props.power = state & BL_CORE_FBBLANK ? FB_BLANK_POWERDOWN :
 			FB_BLANK_UNBLANK;
 	bd->props.state = state;
 
+	mutex_unlock(&bl->state_lock);
 	backlight_update_status(bd);
-	mutex_unlock(&bd->ops_lock);
 
 	return 0;
 }
@@ -639,10 +869,10 @@ int dsi_backlight_get_dpms(struct dsi_backlight_config *bl)
 	int power = 0;
 	int state = 0;
 
-	mutex_lock(&bd->ops_lock);
+	mutex_lock(&bl->state_lock);
 	power = bd->props.power;
 	state = bd->props.state;
-	mutex_unlock(&bd->ops_lock);
+	mutex_unlock(&bl->state_lock);
 
 	if (power == FB_BLANK_POWERDOWN)
 		return SDE_MODE_DPMS_OFF;
@@ -929,10 +1159,10 @@ static int dsi_panel_bl_parse_hbm_node(struct device *parent,
 	int rc;
 	u32 val = 0;
 
-	rc = of_property_read_u32(np, "google,dsi-hbm-brightness-threshold",
-		&val);
+	rc = of_property_read_u32(np,
+		"google,dsi-hbm-range-brightness-threshold", &val);
 	if (rc) {
-		pr_err("Unable to parse dsi-hbm-brightness-threshold\n");
+		pr_err("Unable to parse dsi-hbm-range-brightness-threshold");
 		return rc;
 	}
 	if (val > bl->brightness_max_level) {
@@ -941,18 +1171,18 @@ static int dsi_panel_bl_parse_hbm_node(struct device *parent,
 	}
 	range->user_bri_start = val;
 
-	rc = of_property_read_u32(np, "google,dsi-bl-hbm-min-level",
+	rc = of_property_read_u32(np, "google,dsi-hbm-range-bl-min-level",
 		&val);
 	if (rc) {
-		pr_err("dsi-bl-hbm-min-level unspecified\n");
+		pr_err("dsi-hbm-range-bl-min-level unspecified\n");
 		return rc;
 	}
 	range->panel_bri_start = val;
 
-	rc = of_property_read_u32(np, "google,dsi-bl-hbm-max-level",
+	rc = of_property_read_u32(np, "google,dsi-hbm-range-bl-max-level",
 		&val);
 	if (rc) {
-		pr_err("bl-hbm-max-level unspecified\n");
+		pr_err("dsi-hbm-range-bl-max-level unspecified\n");
 		return rc;
 	}
 	if (val < range->panel_bri_start) {
@@ -963,9 +1193,31 @@ static int dsi_panel_bl_parse_hbm_node(struct device *parent,
 
 	rc = dsi_panel_parse_dt_cmd_set(np,
 		"google,dsi-hbm-range-entry-command",
-		"google,dsi-hbm-commands-state", &range->dsi_cmd);
+		"google,dsi-hbm-range-commands-state", &range->entry_cmd);
 	if (rc)
 		pr_info("Unable to parse optional dsi-hbm-range-entry-command\n");
+
+	rc = of_property_read_u32(np,
+		"google,dsi-hbm-range-num-dimming-frames", &val);
+	if (rc) {
+		pr_debug("Unable to parse optional hbm-range-entry-num-dimming-frames\n");
+		range->num_dimming_frames = 0;
+	} else {
+		range->num_dimming_frames = val;
+	}
+
+	rc = dsi_panel_parse_dt_cmd_set(np,
+		"google,dsi-hbm-range-dimming-stop-command",
+		"google,dsi-hbm-range-commands-state",
+		&range->dimming_stop_cmd);
+	if (rc)
+		pr_debug("Unable to parse optional dsi-hbm-range-dimming-stop-command\n");
+
+	if ((range->dimming_stop_cmd.count && !range->num_dimming_frames) ||
+		(!range->dimming_stop_cmd.count && range->num_dimming_frames)) {
+		pr_err("HBM dimming requires both stop command and number of frames.\n");
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -977,6 +1229,7 @@ int dsi_panel_bl_register(struct dsi_panel *panel)
 	const struct of_device_id *match;
 	int (*register_func)(struct dsi_backlight_config *) = NULL;
 
+	mutex_init(&bl->state_lock);
 	match = of_match_node(dsi_backlight_dt_match, panel->panel_of_node);
 	if (match && match->data) {
 		register_func = match->data;
@@ -1014,13 +1267,14 @@ int dsi_panel_bl_unregister(struct dsi_panel *panel)
 {
 	struct dsi_backlight_config *bl = &panel->bl_config;
 
+	mutex_destroy(&bl->state_lock);
 	if (bl->unregister)
 		bl->unregister(bl);
 
 	if (bl->bl_device)
 		sysfs_remove_groups(&bl->bl_device->dev.kobj, bl_device_groups);
 
-	dsi_panel_bl_hbm_free(panel->parent, &bl->hbm);
+	dsi_panel_bl_hbm_free(panel->parent, bl);
 
 	return 0;
 }
@@ -1137,18 +1391,30 @@ done:
 }
 
 static void dsi_panel_bl_hbm_free(struct device *dev,
-	struct hbm_data **hbm_data)
+	struct dsi_backlight_config *bl)
 {
 	u32 i = 0;
+	struct hbm_data *hbm = bl->hbm;
 
-	if (!hbm_data || !(*hbm_data))
+	if (!hbm)
 		return;
 
-	for (i = 0; i < (*hbm_data)->num_ranges; i++)
-		dsi_panel_destroy_cmd_packets(&(*hbm_data)->ranges[i].dsi_cmd);
+	if (hbm->dimming_workq) {
+		dsi_backlight_hbm_dimming_stop(bl);
+		flush_workqueue(hbm->dimming_workq);
+		destroy_workqueue(hbm->dimming_workq);
+	}
 
-	devm_kfree(dev, *hbm_data);
-	*hbm_data = NULL;
+	dsi_panel_destroy_cmd_packets(&hbm->exit_cmd);
+	dsi_panel_destroy_cmd_packets(&hbm->exit_dimming_stop_cmd);
+
+	for (i = 0; i < hbm->num_ranges; i++) {
+		dsi_panel_destroy_cmd_packets(&hbm->ranges[i].entry_cmd);
+		dsi_panel_destroy_cmd_packets(&hbm->ranges[i].dimming_stop_cmd);
+	}
+
+	devm_kfree(dev, hbm);
+	bl->hbm = NULL;
 }
 
 static int dsi_panel_bl_parse_hbm(struct device *parent,
@@ -1160,12 +1426,14 @@ static int dsi_panel_bl_parse_hbm(struct device *parent,
 	u32 rc = 0;
 	u32 i = 0;
 	u32 num_ranges = 0;
+	u32 val = 0;
+	bool dimming_used = false;
 
 	panel->hbm_mode = false;
 
 	if (bl->hbm) {
 		pr_warn("HBM data already parsed, freeing before reparsing\n");
-		dsi_panel_bl_hbm_free(parent, &bl->hbm);
+		dsi_panel_bl_hbm_free(parent, bl);
 	}
 
 	hbm_ranges_np = of_get_child_by_name(of_node, "google,hbm-ranges");
@@ -1180,13 +1448,43 @@ static int dsi_panel_bl_parse_hbm(struct device *parent,
 		return -EINVAL;
 	}
 
-	bl->hbm = devm_kmalloc(parent, sizeof(struct hbm_data), GFP_KERNEL);
+	bl->hbm = devm_kzalloc(parent, sizeof(struct hbm_data), GFP_KERNEL);
 	if (bl->hbm == NULL) {
 		pr_err("Failed to allocate memory for HBM data\n");
 		return -ENOMEM;
 	}
 
+	rc = dsi_panel_parse_dt_cmd_set(hbm_ranges_np,
+		"google,dsi-hbm-exit-command",
+		"google,dsi-hbm-commands-state", &bl->hbm->exit_cmd);
+	if (rc)
+		pr_info("Unable to parse optional dsi-hbm-exit-command\n");
+
 	bl->hbm->num_ranges = num_ranges;
+
+	rc = of_property_read_u32(hbm_ranges_np,
+		"google,dsi-hbm-exit-num-dimming-frames", &val);
+	if (rc) {
+		pr_debug("Unable to parse optional num-dimming-frames\n");
+		bl->hbm->exit_num_dimming_frames = 0;
+	} else {
+		bl->hbm->exit_num_dimming_frames = val;
+	}
+
+	rc = dsi_panel_parse_dt_cmd_set(hbm_ranges_np,
+		"google,dsi-hbm-exit-dimming-stop-command",
+		"google,dsi-hbm-commands-state",
+		&bl->hbm->exit_dimming_stop_cmd);
+	if (rc)
+		pr_debug("Unable to parse optional dsi-hbm-exit-dimming-stop-command\n");
+
+	if ((bl->hbm->exit_dimming_stop_cmd.count &&
+		 !bl->hbm->exit_num_dimming_frames) ||
+		(!bl->hbm->exit_dimming_stop_cmd.count &&
+		 bl->hbm->exit_num_dimming_frames)) {
+		pr_err("HBM dimming requires both stop command and number of frames.\n");
+		goto exit_free;
+	}
 
 	for_each_child_of_node(hbm_ranges_np, child_np) {
 		rc = dsi_panel_bl_parse_hbm_node(parent, bl,
@@ -1208,18 +1506,40 @@ static int dsi_panel_bl_parse_hbm(struct device *parent,
 			goto exit_free;
 		}
 
+		if (bl->hbm->ranges[i].num_dimming_frames)
+			dimming_used = true;
+
 		/* Fill in user_bri_end for each range */
 		bl->hbm->ranges[i].user_bri_end =
 			bl->hbm->ranges[i + 1].user_bri_start - 1;
 	}
 
+	if (bl->hbm->ranges[num_ranges - 1].num_dimming_frames ||
+		bl->hbm->exit_num_dimming_frames)
+		dimming_used = true;
+
+
+	if (dimming_used) {
+		bl->hbm->dimming_workq =
+			create_singlethread_workqueue("dsi_dimming_workq");
+		if (!bl->hbm->dimming_workq)
+			pr_err("failed to create hbm dimming workq!\n");
+		else
+			INIT_WORK(&bl->hbm->dimming_work,
+				dsi_backlight_hbm_dimming_work);
+	}
+
 	bl->hbm->ranges[i].user_bri_end = bl->brightness_max_level;
 	bl->hbm->cur_range = HBM_RANGE_MAX;
+	bl->hbm->dimming_active = false;
+	bl->hbm->dimming_frames_total = 0;
+	bl->hbm->dimming_frames_left = 0;
+	bl->hbm->panel = panel;
 
 	return 0;
 
 exit_free:
-	dsi_panel_bl_hbm_free(parent, &bl->hbm);
+	dsi_panel_bl_hbm_free(parent, bl);
 	return rc;
 }
 

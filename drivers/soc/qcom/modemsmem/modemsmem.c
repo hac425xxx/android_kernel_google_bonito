@@ -49,19 +49,11 @@ static int __init get_bootmode(char *str)
 }
 __setup("androidboot.mode=", get_bootmode);
 
-bool is_charger_bootmode(void)
-{
-	if (!strncmp(bootmode, "charger", sizeof(bootmode)))
-		return true;
-
-	return false;
-}
-
 static bool is_factory_bootmode(void)
 {
-	int i;
+	int i = 0;
 
-	for (i = 0; i < ARRAY_SIZE(factory_bootmodes); i++)
+	for (; i < ARRAY_SIZE(factory_bootmodes); i++)
 		if (!strncmp(factory_bootmodes[i], bootmode, sizeof(bootmode)))
 			return true;
 	return false;

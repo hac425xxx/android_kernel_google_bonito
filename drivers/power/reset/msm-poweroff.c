@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -68,8 +68,15 @@ static bool scm_deassert_ps_hold_supported;
 /* Download mode master kill-switch */
 static void __iomem *msm_ps_hold;
 static phys_addr_t tcsr_boot_misc_detect;
+/* Runtime could be only changed value once.
+ * There is no API from TZ to re-enable the registers.
+ * So the SDI cannot be re-enabled when it already by-passed.
+ */
 static int download_mode = 1;
+static bool force_warm_reboot_on_thermal;
 static struct kobject dload_kobj;
+static void scm_disable_sdi(void);
+
 
 #ifdef CONFIG_QCOM_DLOAD_MODE
 #define EDL_MODE_PROP "qcom,msm-imem-emergency_download_mode"
@@ -152,8 +159,8 @@ static int panic_prep_restart(struct notifier_block *this,
 		goto out;
 
 	if (tombstone) { /* tamper the panic message for Oops */
-		char pc_symn[KSYM_NAME_LEN] = "<unknown>";
-		char lr_symn[KSYM_NAME_LEN] = "<unknown>";
+		char pc_symn[KSYM_SYMBOL_LEN] = "<unknown>";
+		char lr_symn[KSYM_SYMBOL_LEN] = "<unknown>";
 
 #if defined(CONFIG_ARM)
 		sprint_symbol(pc_symn, tombstone->regs->ARM_pc);
@@ -163,11 +170,11 @@ static int panic_prep_restart(struct notifier_block *this,
 		sprint_symbol(lr_symn, tombstone->regs->regs[30]);
 #endif
 
-		snprintf(kernel_panic_msg, rst_msg_size - 1,
+		scnprintf(kernel_panic_msg, rst_msg_size - 1,
 				"KP: %s PC:%s LR:%s",
 				current->comm, pc_symn, lr_symn);
 	} else {
-		snprintf(kernel_panic_msg, rst_msg_size - 1,
+		scnprintf(kernel_panic_msg, rst_msg_size - 1,
 				"KP: %s", (char *)ptr);
 	}
 
@@ -220,6 +227,9 @@ static void set_dload_mode(int on)
 	ret = scm_set_dload_mode(on ? dload_type : 0, 0);
 	if (ret)
 		pr_err("Failed to set secure DLOAD mode: %d\n", ret);
+
+	if (!on)
+		scm_disable_sdi();
 
 	dload_mode_enabled = on;
 }
@@ -278,7 +288,10 @@ static int dload_set(const char *val, const struct kernel_param *kp)
 	return 0;
 }
 #else
-#define set_dload_mode(x) do {} while (0)
+static void set_dload_mode(int on)
+{
+	scm_disable_sdi();
+}
 
 static void enable_emergency_dload_mode(void)
 {
@@ -290,6 +303,26 @@ static bool get_dload_mode(void)
 	return false;
 }
 #endif
+
+static void scm_disable_sdi(void)
+{
+	int ret;
+	struct scm_desc desc = {
+		.args[0] = 1,
+		.args[1] = 0,
+		.arginfo = SCM_ARGS(2),
+	};
+
+	/* Needed to bypass debug image on some chips */
+	if (!is_scm_armv8())
+		ret = scm_call_atomic2(SCM_SVC_BOOT,
+			       SCM_WDOG_DEBUG_BOOT_PART, 1, 0);
+	else
+		ret = scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_BOOT,
+			  SCM_WDOG_DEBUG_BOOT_PART), &desc);
+	if (ret)
+		pr_err("Failed to disable secure wdog debug: %d\n", ret);
+}
 
 void msm_set_restart_mode(int mode)
 {
@@ -348,12 +381,6 @@ static void msm_restart_prepare(const char *cmd)
 		need_warm_reset = true;
 	}
 
-	/* Hard reset the PMIC unless memory contents must be maintained. */
-	if (need_warm_reset)
-		qpnp_pon_system_pwr_off(PON_POWER_OFF_WARM_RESET);
-	else
-		qpnp_pon_system_pwr_off(PON_POWER_OFF_HARD_RESET);
-
 	if (in_panic) {
 		qpnp_pon_set_restart_reason(PON_RESTART_REASON_PANIC);
 	} else if (cmd != NULL) {
@@ -385,6 +412,14 @@ static void msm_restart_prepare(const char *cmd)
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_KEYS_CLEAR);
 			__raw_writel(0x7766550a, restart_reason);
+		} else if (!strcmp(cmd, "shutdown,thermal")) {
+			qpnp_pon_set_restart_reason(
+				PON_RESTART_REASON_SHUTDOWN_THERMAL);
+			__raw_writel(0x7766550b, restart_reason);
+
+			if (force_warm_reboot_on_thermal)
+				need_warm_reset = true;
+
 		} else if (!strncmp(cmd, "oem-", 4)) {
 			unsigned long code;
 			unsigned long reset_reason;
@@ -416,6 +451,12 @@ static void msm_restart_prepare(const char *cmd)
 			__raw_writel(0x77665501, restart_reason);
 		}
 	}
+
+	/* Hard reset the PMIC unless memory contents must be maintained. */
+	if (need_warm_reset)
+		qpnp_pon_system_pwr_off(PON_POWER_OFF_WARM_RESET);
+	else
+		qpnp_pon_system_pwr_off(PON_POWER_OFF_HARD_RESET);
 
 	flush_cache_all();
 
@@ -452,13 +493,6 @@ static void deassert_ps_hold(void)
 
 static void do_msm_restart(enum reboot_mode reboot_mode, const char *cmd)
 {
-	int ret;
-	struct scm_desc desc = {
-		.args[0] = 1,
-		.args[1] = 0,
-		.arginfo = SCM_ARGS(2),
-	};
-
 	pr_notice("Going down for restart now\n");
 
 	msm_restart_prepare(cmd);
@@ -476,16 +510,6 @@ static void do_msm_restart(enum reboot_mode reboot_mode, const char *cmd)
 		msm_trigger_wdog_bite();
 #endif
 
-	/* Needed to bypass debug image on some chips */
-	if (!is_scm_armv8())
-		ret = scm_call_atomic2(SCM_SVC_BOOT,
-			       SCM_WDOG_DEBUG_BOOT_PART, 1, 0);
-	else
-		ret = scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_BOOT,
-			  SCM_WDOG_DEBUG_BOOT_PART), &desc);
-	if (ret)
-		pr_err("Failed to disable secure wdog debug: %d\n", ret);
-
 enable_sdi_reset:
 	halt_spmi_pmic_arbiter();
 	deassert_ps_hold();
@@ -495,27 +519,10 @@ enable_sdi_reset:
 
 static void do_msm_poweroff(void)
 {
-	int ret;
-	struct scm_desc desc = {
-		.args[0] = 1,
-		.args[1] = 0,
-		.arginfo = SCM_ARGS(2),
-	};
-
 	pr_notice("Powering off the SoC\n");
-#ifdef CONFIG_QCOM_DLOAD_MODE
+
 	set_dload_mode(0);
-#endif
 	qpnp_pon_system_pwr_off(PON_POWER_OFF_SHUTDOWN);
-	/* Needed to bypass debug image on some chips */
-	if (!is_scm_armv8())
-		ret = scm_call_atomic2(SCM_SVC_BOOT,
-			       SCM_WDOG_DEBUG_BOOT_PART, 1, 0);
-	else
-		ret = scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_BOOT,
-			  SCM_WDOG_DEBUG_BOOT_PART), &desc);
-	if (ret)
-		pr_err("Failed to disable wdog debug: %d\n", ret);
 
 	halt_spmi_pmic_arbiter();
 	deassert_ps_hold();
@@ -807,6 +814,9 @@ skip_sysfs_create:
 		scm_deassert_ps_hold_supported = true;
 
 	set_dload_mode(download_mode);
+
+	force_warm_reboot_on_thermal = of_property_read_bool(dev->of_node,
+						"qcom,force-warm-reboot-on-thermal-shutdown");
 
 	return 0;
 

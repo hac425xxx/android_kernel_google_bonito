@@ -148,7 +148,6 @@ do {                                                    \
 #define FW_READ_ATTEMPTS 15
 #define FW_READ_TIMEOUT 4000000
 #define FAKE_REM_RETRY_ATTEMPTS 3
-#define MAX_IMPED 60000
 
 #define WCD_MBHC_BTN_PRESS_COMPL_TIMEOUT_MS  50
 #define ANC_DETECT_RETRY_CNT 7
@@ -508,6 +507,7 @@ struct wcd_mbhc_cb {
 				 bool enable, int anc_num);
 	bool (*is_anc_on)(struct wcd_mbhc *mbhc);
 	bool (*switch_mic_mb)(struct snd_soc_codec *codec, int mic);
+	void (*set_micbias_value_dynamic)(struct snd_soc_codec *, int micbias_mv);
 };
 
 struct wcd_mbhc_fn {

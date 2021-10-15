@@ -197,7 +197,7 @@ DEFINE_EVENT(ufshcd_template, ufshcd_init,
 
 TRACE_EVENT(ufshcd_command,
 	TP_PROTO(const char *dev_name, const char *str, unsigned int tag,
-			u32 doorbell, int transfer_len, u32 intr, u64 lba,
+			u32 doorbell, u32 transfer_len, u32 intr, u64 lba,
 			u8 opcode),
 
 	TP_ARGS(dev_name, str, tag, doorbell, transfer_len, intr, lba, opcode),
@@ -207,7 +207,7 @@ TRACE_EVENT(ufshcd_command,
 		__string(str, str)
 		__field(unsigned int, tag)
 		__field(u32, doorbell)
-		__field(int, transfer_len)
+		__field(u32, transfer_len)
 		__field(u32, intr)
 		__field(u64, lba)
 		__field(u8, opcode)
@@ -225,10 +225,88 @@ TRACE_EVENT(ufshcd_command,
 	),
 
 	TP_printk(
-		"%s: %14s: tag: %-2u cmd: 0x%-2x lba: %-9llu size: %-7d DB: 0x%-8x IS: 0x%x",
+		"%s: %14s: tag: %-2u cmd: 0x%-2x lba: %-9llu size: %-7u DB: 0x%-8x IS: 0x%x",
 		__get_str(dev_name), __get_str(str), __entry->tag,
 		(u32)__entry->opcode, __entry->lba, __entry->transfer_len,
 		__entry->doorbell, __entry->intr
+	)
+);
+
+TRACE_EVENT(ufs_stats,
+	TP_PROTO(struct ufs_stats *ufs_stats, struct ufshcd_io_stat *prev_rstat,
+			struct ufshcd_io_stat *prev_wstat, u64 *avg_time),
+
+	TP_ARGS(ufs_stats, prev_rstat, prev_wstat, avg_time),
+
+	TP_STRUCT__entry(
+		__field(u64,	peak_read)
+		__field(u64,	peak_write)
+		__field(u64,	peak_flush)
+		__field(u64,	peak_discard)
+		__field(u64,	peak_qdepth)
+		__field(u64,	avg_read)
+		__field(u64,	avg_write)
+		__field(u64,	avg_flush)
+		__field(u64,	avg_discard)
+		__field(u64,	r_rc_s)
+		__field(u64,	r_tb_s)
+		__field(u64,	w_rc_s)
+		__field(u64,	w_tb_s)
+		__field(u64,	r_rc_c)
+		__field(u64,	r_tb_c)
+		__field(u64,	w_rc_c)
+		__field(u64,	w_tb_c)
+		__field(u64,	r_rem)
+		__field(u64,	w_rem)
+	),
+
+	TP_fast_assign(
+		__entry->peak_read	= ufs_stats->peak_reqs[TS_READ];
+		__entry->peak_write	= ufs_stats->peak_reqs[TS_WRITE];
+		__entry->peak_flush	= ufs_stats->peak_reqs[TS_FLUSH];
+		__entry->peak_discard	= ufs_stats->peak_reqs[TS_DISCARD];
+		__entry->peak_qdepth	= ufs_stats->peak_queue_depth;
+		__entry->avg_read	= avg_time[TS_READ];
+		__entry->avg_write	= avg_time[TS_WRITE];
+		__entry->avg_flush	= avg_time[TS_FLUSH];
+		__entry->avg_discard	= avg_time[TS_DISCARD];
+		__entry->r_rc_s	= ufs_stats->io_read.req_count_started
+				- prev_rstat->req_count_started;
+		__entry->r_tb_s	= ufs_stats->io_read.total_bytes_started
+				- prev_rstat->total_bytes_started;
+		__entry->w_rc_s	= ufs_stats->io_write.req_count_started
+				- prev_wstat->req_count_started;
+		__entry->w_tb_s	= ufs_stats->io_write.total_bytes_started
+				- prev_wstat->total_bytes_started;
+		__entry->r_rc_c	= ufs_stats->io_read.req_count_completed
+				- prev_rstat->req_count_completed;
+		__entry->r_tb_c	= ufs_stats->io_read.total_bytes_completed
+				- prev_rstat->total_bytes_completed;
+		__entry->w_rc_c	= ufs_stats->io_write.req_count_completed
+				- prev_wstat->req_count_completed;
+		__entry->w_tb_c	= ufs_stats->io_write.total_bytes_completed
+				- prev_wstat->total_bytes_completed;
+		__entry->r_rem	= ufs_stats->io_read.req_count_started
+				- ufs_stats->io_read.req_count_completed;
+		__entry->w_rem	= ufs_stats->io_write.req_count_started
+				- ufs_stats->io_write.req_count_completed;
+	),
+
+	TP_printk(
+		"avg/max(us): read(%llu/%llu) write(%llu/%llu) "
+		"flush(%llu/%llu) discard(%llu/%llu), "
+		"started_bytes/count: read(%llu/%llu) write(%llu/%llu), "
+		"completed_bytes/count: read(%llu/%llu) write(%llu/%llu), "
+		"in-flight_read/write: %llu/%llu, peak_queue_depth: %llu",
+		__entry->avg_read, __entry->peak_read,
+		__entry->avg_write, __entry->peak_write,
+		__entry->avg_flush, __entry->peak_flush,
+		__entry->avg_discard, __entry->peak_discard,
+		__entry->r_tb_s, __entry->r_rc_s,
+		__entry->w_tb_s, __entry->w_rc_s,
+		__entry->r_tb_c, __entry->r_rc_c,
+		__entry->w_tb_c, __entry->w_rc_c,
+		__entry->r_rem, __entry->w_rem, __entry->peak_qdepth
 	)
 );
 

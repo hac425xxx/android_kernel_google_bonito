@@ -305,13 +305,7 @@ void blk_recalc_rq_segments(struct request *rq)
 
 void blk_recount_segments(struct request_queue *q, struct bio *bio)
 {
-	unsigned short seg_cnt;
-
-	/* estimate segment number by bi_vcnt for non-cloned bio */
-	if (bio_flagged(bio, BIO_CLONED))
-		seg_cnt = bio_segments(bio);
-	else
-		seg_cnt = bio->bi_vcnt;
+	unsigned short seg_cnt = bio_segments(bio);
 
 	if (test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags) &&
 			(seg_cnt < queue_max_segments(q)))
@@ -729,9 +723,10 @@ static void blk_account_io_merge(struct request *req)
 	}
 }
 
-static bool crypto_not_mergeable(const struct bio *bio, const struct bio *nxt)
+static bool crypto_not_mergeable(const struct bio *bio, const struct bio *nxt,
+						unsigned int sectors)
 {
-	return (!pfk_allow_merge_bio(bio, nxt));
+	return (!pfk_allow_merge_bio(bio, nxt, sectors));
 }
 
 /*
@@ -761,7 +756,7 @@ static int attempt_merge(struct request_queue *q, struct request *req,
 	    !blk_write_same_mergeable(req->bio, next->bio))
 		return 0;
 
-	if (crypto_not_mergeable(req->bio, next->bio))
+	if (crypto_not_mergeable(req->bio, next->bio, blk_rq_sectors(req)))
 		return 0;
 	/*
 	 * If we are allowed to merge, then append bio list
@@ -878,13 +873,14 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 
 int blk_try_merge(struct request *rq, struct bio *bio)
 {
-	if (blk_rq_pos(rq) + blk_rq_sectors(rq) == bio->bi_iter.bi_sector) {
-		if (crypto_not_mergeable(rq->bio, bio))
+	if (blk_rq_pos(rq) + blk_rq_sectors(rq) ==
+						bio->bi_iter.bi_sector) {
+		if (crypto_not_mergeable(rq->bio, bio, blk_rq_sectors(rq)))
 			return ELEVATOR_NO_MERGE;
 		return ELEVATOR_BACK_MERGE;
 	} else if (blk_rq_pos(rq) - bio_sectors(bio) ==
 						bio->bi_iter.bi_sector) {
-		if (crypto_not_mergeable(bio, rq->bio))
+		if (crypto_not_mergeable(bio, rq->bio, bio_sectors(bio)))
 			return ELEVATOR_NO_MERGE;
 		return ELEVATOR_FRONT_MERGE;
 	}

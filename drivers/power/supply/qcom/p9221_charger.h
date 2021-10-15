@@ -19,8 +19,11 @@
 #define P9221_USER_VOTER			"WLC_USER_VOTER"
 #define P9221_OCP_VOTER				"OCP_VOTER"
 #define P9221_DC_ICL_BPP_UA			700000
+#define P9221_DC_ICL_BPP_RAMP_DEFAULT_UA	900000
+#define P9221_DC_ICL_BPP_RAMP_DELAY_DEFAULT_MS	(7 * 60 * 1000)  /* 7 mins */
 #define P9221_DC_ICL_EPP_UA			1100000
 #define P9221_EPP_THRESHOLD_UV			7000000
+#define P9221_MAX_VOUT_SET_MV_DEFAULT		9000
 
 /*
  * P9221 common registers
@@ -46,44 +49,13 @@
 #define P9221_INT_REG				0x36
 #define P9221_INT_MASK				0xF7
 #define P9221_INT_ENABLE_REG			0x38
-
-/*
- * P9221 Rx registers (x != 5)
- */
-#define P9221_CHARGE_STAT_REG			0x3A
-#define P9221_EPT_REG				0x3B
-#define P9221_VOUT_ADC_REG			0x3C
-#define P9221_VOUT_ADC_MASK			0x0FFF
-#define P9221_VOUT_SET_REG			0x3E
-#define P9221_MAX_VOUT_SET_MV_DEFAULT		9000
-#define P9221_VRECT_ADC_REG			0x40
-#define P9221_VRECT_ADC_MASK			0x0FFF
-#define P9221_OVSET_REG				0x42
-#define P9221_OVSET_MASK			0x70
-#define P9221_OVSET_SHIFT			4
-#define P9221_RX_IOUT_REG			0x44
-#define P9221_DIE_TEMP_ADC_REG			0x46
-#define P9221_DIE_TEMP_ADC_MASK			0x0FFF
-#define P9221_OP_FREQ_REG			0x48
-#define P9221_ILIM_SET_REG			0x4A
-#define P9221_ALIGN_X_ADC_REG			0x4B
-#define P9221_ALIGN_Y_ADC_REG			0x4C
-#define P9221_OP_MODE_REG			0x4D
 #define P9221_COM_REG				0x4E
-#define P9221_FW_SWITCH_KEY_REG			0x4F
-#define P9221_INT_CLEAR_REG			0x56
-#define P9221_RXID_REG				0x5C
-#define P9221_RXID_LEN				6
-#define P9221_MPREQ_REG				0x5C
-#define P9221_MPREQ_LEN				6
-#define P9221_FOD_REG				0x68
-#define P9221_NUM_FOD				16
-#define P9221_RX_RAWIOUT_REG			0x7A
-#define P9221_RX_RAWIOUT_MASK			0xFFF
-#define P9221_PMA_AD_REG			0x7C
-#define P9221_RX_PINGFREQ_REG			0xFC
-#define P9221_RX_PINGFREQ_MASK			0xFFF
-#define P9221_LAST_REG				0xFF
+
+enum p9221_align_mfg_chk_state {
+	ALIGN_MFG_FAILED = -1,
+	ALIGN_MFG_CHECKING,
+	ALIGN_MFG_PASSED,
+};
 
 /*
  * P9221R5 unique registers
@@ -247,10 +219,15 @@ struct p9221_charger_platform_data {
 	int				irq_det_int;
 	int				qien_gpio;
 	int				max_vout_mv;
-	u8				fod[P9221_NUM_FOD];
-	u8				fod_epp[P9221_NUM_FOD];
+	u8				fod[P9221R5_NUM_FOD];
+	u8				fod_epp[P9221R5_NUM_FOD];
 	int				fod_num;
 	int				fod_epp_num;
+	int				nb_alignment_freq;
+	int				*alignment_freq;
+	u32				alignment_scalar;
+	u32				power_mitigate_threshold;
+	u32				alignment_hysteresis;
 };
 
 struct p9221_charger_data {
@@ -265,9 +242,16 @@ struct p9221_charger_data {
 	struct device			*dev;
 	struct delayed_work		notifier_work;
 	struct delayed_work		dcin_work;
+	struct delayed_work		align_work;
 	struct delayed_work		tx_work;
+	struct delayed_work		icl_ramp_work;
+	struct delayed_work		power_mitigation_work;
+	struct work_struct		uevent_work;
+	struct alarm			icl_ramp_alarm;
 	struct timer_list		vrect_timer;
+	struct timer_list		align_timer;
 	struct bin_attribute		bin;
+	struct logbuffer		*log;
 	int				online;
 	bool				enabled;
 	u16				addr;
@@ -288,6 +272,24 @@ struct p9221_charger_data {
 	bool				check_det;
 	int				last_capacity;
 	bool				resume_complete;
+	bool				icl_ramp;
+	u32				icl_ramp_ua;
+	u32				icl_ramp_delay_ms;
+	int				align;
+	int				align_count;
+	int				alignment;
+	u8				alignment_str[(sizeof(u32) * 3) + 1];
+	int				alignment_last;
+	enum p9221_align_mfg_chk_state  alignment_capable;
+	int				mfg_check_count;
+	u16				mfg;
+	int				alignment_time;
+	u32				current_filtered;
+	u32				current_sample_cnt;
+	u32				mitigate_threshold;
+	u32				fod_cnt;
+	bool				trigger_power_mitigation;
+	bool                            wait_for_online;
 };
 
 struct p9221_prop_reg_map_entry {

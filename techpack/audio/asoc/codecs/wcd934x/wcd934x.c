@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -145,7 +145,21 @@ static const struct snd_kcontrol_new name##_mux = \
 #define  CF_MIN_3DB_150HZ		0x2
 
 #define CPE_ERR_WDOG_BITE BIT(0)
-#define CPE_FATAL_IRQS CPE_ERR_WDOG_BITE
+#define CPE_ERR_BUFFER_OVERFLOW BIT(1)
+#define CPE_ERR_LAB_OVFUNF_ERR BIT(2)
+#define CPE_ERR_US_BUF_OVFUNF BIT(3)
+#define CPE_ERR_SPI_SLAVE_ERR BIT(4)
+#define CPE_ERR_MPU_ERR BIT(5)
+#define CPE_ERR_AUDIO_DMA_ERR BIT(6)
+#define CPE_ERR_DSP_BUS_INVALID_ADDR BIT(8)
+#define CPE_ERR_DSP_BUS_INVALID_MEM_ACC_ERR BIT(9)
+#define CPE_ERR_DSP_BUS_INVALID_XFER_TYPE_ERR BIT(10)
+#define CPE_ERR_AHB_BUS_INVALID_ADDR_ERR BIT(11)
+#define CPE_ERR_AHB_BUS_INVALID_MEM_ACC_ERR BIT(12)
+#define CPE_ERR_AHB_BUS_INVALID_XFER_TYPE_ERR BIT(13)
+#define CPE_FATAL_IRQS \
+	(CPE_ERR_WDOG_BITE | CPE_ERR_BUFFER_OVERFLOW | \
+	CPE_ERR_DSP_BUS_INVALID_ADDR)
 
 #define WCD934X_MAD_AUDIO_FIRMWARE_PATH "wcd934x/wcd934x_mad_audio.bin"
 
@@ -636,6 +650,7 @@ struct tavil_priv {
 	struct platform_device *pdev_child_devices
 		[WCD934X_CHILD_DEVICES_MAX];
 	int child_count;
+	int codec_state;
 };
 
 static const struct tavil_reg_mask_val tavil_spkr_default[] = {
@@ -657,6 +672,27 @@ static const struct tavil_reg_mask_val tavil_spkr_mode1[] = {
 };
 
 static int __tavil_enable_efuse_sensing(struct tavil_priv *tavil);
+
+enum {
+	CODEC_STATE_UNKNOWN = -99,
+	CODEC_STATE_OVERFLOW = -2,
+	CODEC_STATE_UNDERFLOW,
+	CODEC_STATE_ONLINE,
+};
+
+static ssize_t codec_state_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct tavil_priv *tavil = (struct tavil_priv *)dev_get_drvdata(dev);
+
+	if (tavil) {
+		int codec_state = tavil->codec_state;
+		tavil->codec_state = CODEC_STATE_ONLINE;
+		return sprintf(buf, "%d", codec_state);
+	} else
+		return sprintf(buf, "%d", CODEC_STATE_UNKNOWN);
+}
+static DEVICE_ATTR_RO(codec_state);
 
 /**
  * tavil_set_spkr_gain_offset - offset the speaker path
@@ -2099,7 +2135,7 @@ static int tavil_codec_enable_spkr_anc(struct snd_soc_dapm_widget *w,
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
 		ret = tavil_codec_enable_anc(w, kcontrol, event);
-		schedule_delayed_work(&tavil->spk_anc_dwork.dwork,
+		queue_delayed_work(system_power_efficient_wq, &tavil->spk_anc_dwork.dwork,
 				      msecs_to_jiffies(spk_anc_en_delay));
 		break;
 	case SND_SOC_DAPM_POST_PMD:
@@ -2951,11 +2987,34 @@ static int tavil_codec_spk_boost_event(struct snd_soc_dapm_widget *w,
 
 static int __tavil_codec_enable_swr(struct snd_soc_dapm_widget *w, int event)
 {
-	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
-	struct tavil_priv *tavil;
+	struct snd_soc_codec *codec = 0;
+	struct snd_soc_dapm_context *dapm = 0;
+	struct tavil_priv *tavil = 0;
+	struct snd_soc_component *comp = 0;
+	struct platform_device *pdev = 0;
+	struct tavil_swr_ctrl_data *ctrl_data = 0;
+
 	int ch_cnt = 0;
 
-	tavil = snd_soc_codec_get_drvdata(codec);
+	if (w)
+		dapm = w->dapm;
+	if (dapm)
+		comp = snd_soc_dapm_to_component(w->dapm);
+	if (comp)
+		codec = snd_soc_component_to_codec(comp);
+	if (codec)
+		tavil = snd_soc_codec_get_drvdata(codec);
+	if (tavil)
+		ctrl_data = tavil->swr.ctrl_data;
+	if (ctrl_data)
+		pdev = ctrl_data->swr_pdev;
+
+	if (!pdev) {
+		pr_err("%s: w=%p; dapm=%p; comp=%p; codec=%p; tavil=%p; ctrl_data=%p; pdev=%p\n",
+			__func__, w, dapm, comp, codec, tavil, ctrl_data, pdev);
+		WARN_ON_ONCE(1);
+		return -EFAULT;
+	}
 
 	if (!tavil->swr.ctrl_data)
 		return -EINVAL;
@@ -2964,6 +3023,10 @@ static int __tavil_codec_enable_swr(struct snd_soc_dapm_widget *w, int event)
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
+		if (!pdev) {
+			pr_err("%s: No pdev (1)\n", __func__);
+			return -EFAULT;
+		}
 		if (((strnstr(w->name, "INT7_", sizeof("RX INT7_"))) ||
 			(strnstr(w->name, "INT7 MIX2",
 						sizeof("RX INT7 MIX2")))))
@@ -2973,12 +3036,16 @@ static int __tavil_codec_enable_swr(struct snd_soc_dapm_widget *w, int event)
 			tavil->swr.rx_8_count++;
 		ch_cnt = !!(tavil->swr.rx_7_count) + tavil->swr.rx_8_count;
 
-		swrm_wcd_notify(tavil->swr.ctrl_data[0].swr_pdev,
+		swrm_wcd_notify(pdev,
 				SWR_DEVICE_UP, NULL);
-		swrm_wcd_notify(tavil->swr.ctrl_data[0].swr_pdev,
+		swrm_wcd_notify(pdev,
 				SWR_SET_NUM_RX_CH, &ch_cnt);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
+		if (!pdev) {
+			pr_err("%s: No pdev (2)\n", __func__);
+			return -EFAULT;
+		}
 		if ((strnstr(w->name, "INT7_", sizeof("RX INT7_")))  ||
 			(strnstr(w->name, "INT7 MIX2",
 			sizeof("RX INT7 MIX2"))))
@@ -2988,12 +3055,12 @@ static int __tavil_codec_enable_swr(struct snd_soc_dapm_widget *w, int event)
 			tavil->swr.rx_8_count--;
 		ch_cnt = !!(tavil->swr.rx_7_count) + tavil->swr.rx_8_count;
 
-		swrm_wcd_notify(tavil->swr.ctrl_data[0].swr_pdev,
+		swrm_wcd_notify(pdev,
 				SWR_SET_NUM_RX_CH, &ch_cnt);
 
 		break;
 	}
-	dev_dbg(tavil->dev, "%s: %s: current swr ch cnt: %d\n",
+	dev_info(tavil->dev, "%s: %s: current swr ch cnt: %d\n",
 		__func__, w->name, ch_cnt);
 
 	return 0;
@@ -4472,11 +4539,11 @@ static int tavil_codec_enable_dec(struct snd_soc_dapm_widget *w,
 			snd_soc_update_bits(codec, hpf_gate_reg, 0x02, 0x00);
 		}
 		/* schedule work queue to Remove Mute */
-		schedule_delayed_work(&tavil->tx_mute_dwork[decimator].dwork,
+		queue_delayed_work(system_power_efficient_wq, &tavil->tx_mute_dwork[decimator].dwork,
 				      msecs_to_jiffies(tx_unmute_delay));
 		if (tavil->tx_hpf_work[decimator].hpf_cut_off_freq !=
 							CF_MIN_3DB_150HZ)
-			schedule_delayed_work(
+			queue_delayed_work(system_power_efficient_wq,
 					&tavil->tx_hpf_work[decimator].dwork,
 					msecs_to_jiffies(300));
 		/* apply gain after decimator is enabled */
@@ -4930,7 +4997,7 @@ static int __tavil_codec_enable_micbias(struct snd_soc_dapm_widget *w,
 	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
 	int micb_num;
 
-	dev_dbg(codec->dev, "%s: wname: %s, event: %d\n",
+	dev_info(codec->dev, "%s: wname: %s, event: %d\n",
 		__func__, w->name, event);
 
 	if (strnstr(w->name, "MIC BIAS1", sizeof("MIC BIAS1")))
@@ -4951,14 +5018,24 @@ static int __tavil_codec_enable_micbias(struct snd_soc_dapm_widget *w,
 		 * so use ref count to handle micbias pullup
 		 * and enable requests
 		 */
+#ifdef CONFIG_WCD_MICBIAS_USE_PULLUP
+		tavil_micbias_control(codec, micb_num, MICB_PULLUP_ENABLE, true);
+#else
 		tavil_micbias_control(codec, micb_num, MICB_ENABLE, true);
+#endif
+		dev_info(codec->dev, "%s: wname: %s: enable\n", __func__, w->name);
 		break;
 	case SND_SOC_DAPM_POST_PMU:
 		/* wait for cnp time */
 		usleep_range(1000, 1100);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
+#ifdef CONFIG_WCD_MICBIAS_USE_PULLUP
+		tavil_micbias_control(codec, micb_num, MICB_PULLUP_DISABLE, true);
+#else
 		tavil_micbias_control(codec, micb_num, MICB_DISABLE, true);
+#endif
+		dev_info(codec->dev, "%s: wname: %s: disable\n", __func__, w->name);
 		break;
 	};
 
@@ -8679,6 +8756,13 @@ static int tavil_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	return 0;
 }
 
+static int tavil_set_dai_sysclk(struct snd_soc_dai *dai,
+		int clk_id, unsigned int freq, int dir)
+{
+	pr_debug("%s\n", __func__);
+	return 0;
+}
+
 static struct snd_soc_dai_ops tavil_dai_ops = {
 	.startup = tavil_startup,
 	.shutdown = tavil_shutdown,
@@ -8693,6 +8777,7 @@ static struct snd_soc_dai_ops tavil_i2s_dai_ops = {
 	.shutdown = tavil_shutdown,
 	.hw_params = tavil_hw_params,
 	.prepare = tavil_prepare,
+	.set_sysclk = tavil_set_dai_sysclk,
 	.set_fmt = tavil_set_dai_fmt,
 };
 
@@ -9009,7 +9094,7 @@ static int tavil_dig_core_power_collapse(struct tavil_priv *tavil,
 
 	if (req_state == POWER_COLLAPSE) {
 		if (tavil->power_active_ref == 0) {
-			schedule_delayed_work(&tavil->power_gate_work,
+			queue_delayed_work(system_power_efficient_wq, &tavil->power_gate_work,
 			msecs_to_jiffies(dig_core_collapse_timer * 1000));
 		}
 	} else if (req_state == POWER_RESUME) {
@@ -9616,12 +9701,16 @@ static irqreturn_t tavil_slimbus_irq(int irq, void *data)
 			if (!(int_val & (1 << (port_id % 8))))
 				continue;
 		}
-		if (val & WCD934X_SLIM_IRQ_OVERFLOW)
+		if (val & WCD934X_SLIM_IRQ_OVERFLOW) {
 			dev_err_ratelimited(tavil->dev, "%s: overflow error on %s port %d, value %x\n",
 			   __func__, (tx ? "TX" : "RX"), port_id, val);
-		if (val & WCD934X_SLIM_IRQ_UNDERFLOW)
+			tavil->codec_state = CODEC_STATE_OVERFLOW;
+		}
+		if (val & WCD934X_SLIM_IRQ_UNDERFLOW) {
 			dev_err_ratelimited(tavil->dev, "%s: underflow error on %s port %d, value %x\n",
 			   __func__, (tx ? "TX" : "RX"), port_id, val);
+			tavil->codec_state = CODEC_STATE_UNDERFLOW;
+		}
 		if ((val & WCD934X_SLIM_IRQ_OVERFLOW) ||
 			(val & WCD934X_SLIM_IRQ_UNDERFLOW)) {
 			if (!tx)
@@ -10252,7 +10341,6 @@ static int tavil_soc_codec_probe(struct snd_soc_codec *codec)
 	 * can be released allowing the codec to go to SVS2.
 	 */
 	tavil_vote_svs(tavil, false);
-
 	return ret;
 
 err_pdata:
@@ -11000,6 +11088,12 @@ static int tavil_probe(struct platform_device *pdev)
 		goto err_cdc_reg;
 	}
 	schedule_work(&tavil->tavil_add_child_devices_work);
+
+	tavil->codec_state = CODEC_STATE_ONLINE;
+	ret = device_create_file(&pdev->dev, &dev_attr_codec_state);
+	if (ret)
+		dev_err(&pdev->dev, "%s: create codec state node failed\n",
+		 __func__);
 
 	return ret;
 

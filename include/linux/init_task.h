@@ -193,16 +193,6 @@ extern struct task_group root_task_group;
 # define INIT_TASK_TI(tsk)
 #endif
 
-#ifdef CONFIG_SAFESTACK
-# define INIT_UNSAFE_STACK \
-	.unsafe_stack = (void *)init_unsafe_stack,			\
-	.unsafe_stack_ptr = (void *)init_unsafe_stack 			\
-				+ UNSAFE_STACK_SIZE,			\
-	.unsafe_saved_ptr = NULL,
-#else
-# define INIT_UNSAFE_STACK
-#endif
-
 /*
  *  INIT_TASK is used to set up the first task table, touch at
  * your own risk!. Base=0, limit=0x1fffff (=2MB)
@@ -212,7 +202,6 @@ extern struct task_group root_task_group;
 	INIT_TASK_TI(tsk)						\
 	.state		= 0,						\
 	.stack		= init_stack,					\
-	INIT_UNSAFE_STACK						\
 	.usage		= ATOMIC_INIT(2),				\
 	.flags		= PF_KTHREAD,					\
 	.prio		= MAX_PRIO-20,					\
@@ -221,6 +210,7 @@ extern struct task_group root_task_group;
 	.policy		= SCHED_NORMAL,					\
 	.cpus_allowed	= CPU_MASK_ALL,					\
 	.nr_cpus_allowed= NR_CPUS,					\
+	.cpus_requested	= CPU_MASK_ALL,					\
 	.mm		= NULL,						\
 	.active_mm	= &init_mm,					\
 	.restart_block = {						\

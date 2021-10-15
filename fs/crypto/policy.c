@@ -12,6 +12,7 @@
 #include <linux/string.h>
 #include <linux/mount.h>
 #include "fscrypt_private.h"
+#include "fscrypt_ice.h"
 
 /*
  * check whether an encryption policy is consistent with an encryption context
@@ -43,6 +44,10 @@ static int create_encryption_context_from_policy(struct inode *inode,
 		return -EINVAL;
 
 	if (policy->flags & ~FS_POLICY_FLAGS_VALID)
+		return -EINVAL;
+
+	if ((policy->flags & FS_POLICY_FLAG_IV_INO_LBLK_32) &&
+	    policy->contents_encryption_mode != FS_ENCRYPTION_MODE_PRIVATE)
 		return -EINVAL;
 
 	ctx.contents_encryption_mode = policy->contents_encryption_mode;
@@ -80,6 +85,8 @@ int fscrypt_ioctl_set_policy(struct file *filp, const void __user *arg)
 	if (ret == -ENODATA) {
 		if (!S_ISDIR(inode->i_mode))
 			ret = -ENOTDIR;
+		else if (IS_DEADDIR(inode))
+			ret = -ENOENT;
 		else if (!inode->i_sb->s_cop->empty_dir(inode))
 			ret = -ENOTEMPTY;
 		else
@@ -150,8 +157,7 @@ EXPORT_SYMBOL(fscrypt_ioctl_get_policy);
  * malicious offline violations of this constraint, while the link and rename
  * checks are needed to prevent online violations of this constraint.
  *
- * Return: 1 if permitted, 0 if forbidden.  If forbidden, the caller must fail
- * the filesystem operation with EPERM.
+ * Return: 1 if permitted, 0 if forbidden.
  */
 int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 {
@@ -194,16 +200,20 @@ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 	res = fscrypt_get_encryption_info(child);
 	if (res)
 		return 0;
-	parent_ci = parent->i_crypt_info;
-	child_ci = child->i_crypt_info;
+	parent_ci = READ_ONCE(parent->i_crypt_info);
+	child_ci = READ_ONCE(child->i_crypt_info);
 
 	if (parent_ci && child_ci) {
-		return memcmp(parent_ci->ci_master_key, child_ci->ci_master_key,
+		return memcmp(parent_ci->ci_master_key_descriptor,
+			      child_ci->ci_master_key_descriptor,
 			      FS_KEY_DESCRIPTOR_SIZE) == 0 &&
 			(parent_ci->ci_data_mode == child_ci->ci_data_mode) &&
 			(parent_ci->ci_filename_mode ==
 			 child_ci->ci_filename_mode) &&
-			(parent_ci->ci_flags == child_ci->ci_flags);
+			((parent_ci->ci_flags &
+			  ~FS_POLICY_FLAG_IV_INO_LBLK_32) ==
+			 (child_ci->ci_flags &
+			  ~FS_POLICY_FLAG_IV_INO_LBLK_32));
 	}
 
 	res = cops->get_context(parent, &parent_ctx, sizeof(parent_ctx));
@@ -221,7 +231,8 @@ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 		 child_ctx.contents_encryption_mode) &&
 		(parent_ctx.filenames_encryption_mode ==
 		 child_ctx.filenames_encryption_mode) &&
-		(parent_ctx.flags == child_ctx.flags);
+		((parent_ctx.flags & ~FS_POLICY_FLAG_IV_INO_LBLK_32) ==
+		 (child_ctx.flags & ~FS_POLICY_FLAG_IV_INO_LBLK_32));
 }
 EXPORT_SYMBOL(fscrypt_has_permitted_context);
 
@@ -245,7 +256,7 @@ int fscrypt_inherit_context(struct inode *parent, struct inode *child,
 	if (res < 0)
 		return res;
 
-	ci = parent->i_crypt_info;
+	ci = READ_ONCE(parent->i_crypt_info);
 	if (ci == NULL)
 		return -ENOKEY;
 
@@ -253,7 +264,12 @@ int fscrypt_inherit_context(struct inode *parent, struct inode *child,
 	ctx.contents_encryption_mode = ci->ci_data_mode;
 	ctx.filenames_encryption_mode = ci->ci_filename_mode;
 	ctx.flags = ci->ci_flags;
-	memcpy(ctx.master_key_descriptor, ci->ci_master_key,
+
+	if (ctx.contents_encryption_mode == FS_ENCRYPTION_MODE_PRIVATE &&
+	    fscrypt_force_iv_ino_lblk_32())
+		ctx.flags |= FS_POLICY_FLAG_IV_INO_LBLK_32;
+
+	memcpy(ctx.master_key_descriptor, ci->ci_master_key_descriptor,
 	       FS_KEY_DESCRIPTOR_SIZE);
 	get_random_bytes(ctx.nonce, FS_KEY_DERIVATION_NONCE_SIZE);
 	res = parent->i_sb->s_cop->set_context(child, &ctx,

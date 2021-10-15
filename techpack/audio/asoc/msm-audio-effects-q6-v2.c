@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2017, 2019 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -11,6 +11,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/ratelimit.h>
 #include <sound/compress_params.h>
 #include <sound/devdep_params.h>
 #include <dsp/apr_audio-v2.h>
@@ -22,7 +23,8 @@
 #define GET_NEXT(ptr, upper_limit, rc)                                  \
 ({                                                                      \
 	if (((ptr) + 1) > (upper_limit)) {                              \
-		pr_err("%s: param list out of boundary\n", __func__);   \
+		pr_err_ratelimited("%s: param list out of boundary\n",  \
+				   __func__);				\
 		(rc) = -EINVAL;                                         \
 	}                                                               \
 	((rc) == 0) ? *(ptr)++ :  -EINVAL;                              \
@@ -31,7 +33,8 @@
 #define CHECK_PARAM_LEN(len, max_len, tag, rc)                          \
 do {                                                                    \
 	if ((len) > (max_len)) {                                        \
-		pr_err("%s: params length overflows\n", (tag));         \
+		pr_err_ratelimited("%s: params length overflows\n",	\
+				   (tag));				\
 		(rc) = -EINVAL;                                         \
 	}                                                               \
 } while (0)
@@ -79,7 +82,7 @@ int msm_audio_effects_enable_extn(struct audio_client *ac,
 	if (effects->virtualizer.enable_flag)
 		q6asm_send_audio_effects_params(ac, (char *)&updt_params[0],
 					params_length);
-	memset(updt_params, 0, MAX_ENABLE_CMD_SIZE);
+	memset(updt_params, 0, sizeof(updt_params));
 	params_length = 0;
 	updt_params[0] = AUDPROC_MODULE_ID_BASS_BOOST;
 	updt_params[1] = AUDPROC_PARAM_ID_ENABLE;
@@ -89,7 +92,7 @@ int msm_audio_effects_enable_extn(struct audio_client *ac,
 	if (effects->bass_boost.enable_flag)
 		q6asm_send_audio_effects_params(ac, (char *)&updt_params[0],
 					params_length);
-	memset(updt_params, 0, MAX_ENABLE_CMD_SIZE);
+	memset(updt_params, 0, sizeof(updt_params));
 	params_length = 0;
 	updt_params[0] = AUDPROC_MODULE_ID_POPLESS_EQUALIZER;
 	updt_params[1] = AUDPROC_PARAM_ID_ENABLE;
@@ -250,7 +253,8 @@ int msm_audio_effects_virtualizer_handler(struct audio_client *ac,
 			}
 			break;
 		default:
-			pr_err("%s: Invalid command to set config\n", __func__);
+			pr_err_ratelimited("%s: Invalid command to set config\n",
+					   __func__);
 			break;
 		}
 	}
@@ -720,7 +724,8 @@ int msm_audio_effects_reverb_handler(struct audio_client *ac,
 			}
 			break;
 		default:
-			pr_err("%s: Invalid command to set config\n", __func__);
+			pr_err_ratelimited("%s: Invalid command to set config\n",
+					   __func__);
 			break;
 		}
 	}
@@ -855,7 +860,8 @@ int msm_audio_effects_bass_boost_handler(struct audio_client *ac,
 			}
 			break;
 		default:
-			pr_err("%s: Invalid command to set config\n", __func__);
+			pr_err_ratelimited("%s: Invalid command to set config\n",
+					   __func__);
 			break;
 		}
 	}
@@ -964,7 +970,8 @@ int msm_audio_effects_pbe_handler(struct audio_client *ac,
 			}
 			break;
 		default:
-			pr_err("%s: Invalid command to set config\n", __func__);
+			pr_err_ratelimited("%s: Invalid command to set config\n",
+					   __func__);
 			break;
 		}
 	}
@@ -1194,7 +1201,8 @@ int msm_audio_effects_popless_eq_handler(struct audio_client *ac,
 			}
 			break;
 		default:
-			pr_err("%s: Invalid command to set config\n", __func__);
+			pr_err_ratelimited("%s: Invalid command to set config\n",
+					   __func__);
 			break;
 		}
 	}
@@ -1349,7 +1357,7 @@ static int __msm_audio_effects_volume_handler(struct audio_client *ac,
 			}
 			break;
 		default:
-			pr_err("%s: Invalid command id: %d to set config\n",
+			pr_err_ratelimited("%s: Invalid command id: %d to set config\n",
 				__func__, command_id);
 			break;
 		}

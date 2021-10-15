@@ -492,7 +492,7 @@ int fts_wait_for_ready(struct fts_ts_info *info)
 					__func__);
 
 			if (info->lowpower_mode) {
-				schedule_delayed_work(&info->reset_work,
+				queue_delayed_work(system_power_efficient_wq, &info->reset_work,
 					msecs_to_jiffies(10));
 			}
 			break;
@@ -809,10 +809,10 @@ static unsigned char fts_event_handler_type_b(struct fts_ts_info *info,
 			info->fts_power_state );
 #endif
 
-	if (info->fts_power_state == FTS_POWER_STATE_LOWPOWER)
-		EventID = data[EventNum * FTS_EVENT_SIZE] & 0xFF;
-	else
-		EventID = data[EventNum * FTS_EVENT_SIZE] & 0x0F;
+		if (info->fts_power_state == FTS_POWER_STATE_LOWPOWER)
+			EventID = data[EventNum * FTS_EVENT_SIZE] & 0xFF;
+		else
+			EventID = data[EventNum * FTS_EVENT_SIZE] & 0x0F;
 
 		if ((EventID >= 3) && (EventID <= 5)) {
 			LastLeftEvent = 0;
@@ -1808,7 +1808,7 @@ static int fts_input_open(struct input_dev *dev)
 	tsp_debug_info(&info->client->dev, "%s\n", __func__);
 
 #ifdef USE_OPEN_DWORK
-	schedule_delayed_work(&info->open_work,
+	queue_delayed_work(system_power_efficient_wq, &info->open_work,
 			      msecs_to_jiffies(TOUCH_OPEN_DWORK_TIME));
 #else
 	retval = fts_start_device(info);

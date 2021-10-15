@@ -1857,7 +1857,7 @@ static int msm_tdm_snd_hw_params(struct snd_pcm_substream *substream,
 
 			ret = snd_soc_dai_set_pll(codec_dai, 0, 1,
 				Q6AFE_LPASS_IBIT_CLK_12_P288_MHZ,
-				Q6AFE_LPASS_IBIT_CLK_12_P288_MHZ);
+				Q6AFE_LPASS_IBIT_CLK_12_P288_MHZ*2);
 
 			if (ret < 0) {
 				pr_err("%s: failed to set codec pll, err:%d\n",
@@ -1865,7 +1865,7 @@ static int msm_tdm_snd_hw_params(struct snd_pcm_substream *substream,
 			}
 
 			ret = snd_soc_dai_set_sysclk(codec_dai, 1,
-				Q6AFE_LPASS_IBIT_CLK_12_P288_MHZ,
+				Q6AFE_LPASS_IBIT_CLK_12_P288_MHZ*2,
 				SND_SOC_CLOCK_IN);
 
 			if (ret < 0) {
@@ -3548,9 +3548,9 @@ static struct snd_soc_dai_link msm_tdm_fe_dai_link[] = {
 
 static struct snd_soc_dai_link msm_spi_dai_links[] = {
 	{
-	 .name = "SoundTrigger",
+	 .name = "SoundTrigger 1",
 	 .stream_name = "SoundTrigger Capture",
-	 .cpu_dai_name = "rt5514-dsp-fe-dai",
+	 .cpu_dai_name = "rt5514-dsp-fe-dai1",
 	 .platform_name = "spi32765.0",
 	 .codec_name = "msm-stub-codec.1",
 	 .codec_dai_name = "msm-stub-tx",
@@ -3561,9 +3561,33 @@ static struct snd_soc_dai_link msm_spi_dai_links[] = {
 		     SND_SOC_DPCM_TRIGGER_POST},
 	},
 	{
-	 .name = "SPI PCM",
+	 .name = "SoundTrigger 2",
+	 .stream_name = "SoundTrigger Capture 2",
+	 .cpu_dai_name = "rt5514-dsp-fe-dai2",
+	 .platform_name = "spi32765.0",
+	 .codec_name = "msm-stub-codec.1",
+	 .codec_dai_name = "msm-stub-tx",
+	 .ignore_suspend = 1,
+	 .dynamic = 1,
+	 .dpcm_capture = 1,
+	 .trigger = {SND_SOC_DPCM_TRIGGER_POST,
+		     SND_SOC_DPCM_TRIGGER_POST},
+	},
+	{
+	 .name = "SPI PCM 1",
 	 .stream_name = "SPI Capture",
-	 .cpu_dai_name = "rt5514-dsp-be-dai",
+	 .cpu_dai_name = "rt5514-dsp-be-dai1",
+	 .platform_name = "spi32765.0",
+	 .codec_name = "msm-stub-codec.1",
+	 .codec_dai_name = "msm-stub-tx",
+	 .ignore_suspend = 1,
+	 .dpcm_capture = 1,
+	 .no_pcm = 1,
+	},
+	{
+	 .name = "SPI PCM 2",
+	 .stream_name = "SPI Capture 2",
+	 .cpu_dai_name = "rt5514-dsp-be-dai2",
 	 .platform_name = "spi32765.0",
 	 .codec_name = "msm-stub-codec.1",
 	 .codec_dai_name = "msm-stub-tx",

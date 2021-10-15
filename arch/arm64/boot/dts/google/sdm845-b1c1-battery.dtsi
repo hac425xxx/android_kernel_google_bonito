@@ -20,7 +20,7 @@
 	google,boost_to_5_1V;
 	qcom,dc-icl-ua = <1100000>;
 	google,batt_psy_is_bms;
-	google,usb-port-tz-name = "usbc-therm-adc";
+	google,usb-port-tz-name = "usbc-therm-monitor";
 	google,wlc-thermal-mitigation = <1100000 500000 250000 110000>;
 	google,low-batt-threshold = <2>;
 	qcom,hvdcp-disable;
@@ -37,6 +37,7 @@
 	qcom,fg-jeita-thresholds = <0 0 55 55>;
 	qcom,fg-force-load-profile;
 	google,fg-soc-irq-disable;
+	google,batt_psy_is_bms;
 };
 
 &tlmm {
@@ -104,6 +105,18 @@
 			 30   0   0
 		>;
 		google,chg-cc-tolerance = <25>;
+
+		/* b/170700459 thresholds */
+		google,bd-resume-abs-temp = <280>;
+		google,bd-resume-soc = <50>;
+		google,bd-resume-time = <14400>;  /* 4 hours */
+		google,bd-resume-temp = <290>;
+		google,bd-trigger-time = <21600>; /* 6 hours */
+		google,bd-trigger-temp = <320>;
+		google,bd-trigger-voltage = <4270000>;
+		google,bd-recharge-voltage = <4250000>;
+		google,bd-drainto-soc = <80>;
+		google,bd-recharge-soc = <79>;
 	};
 
 	google_overheat_mitigation: google,overheat_mitigation {

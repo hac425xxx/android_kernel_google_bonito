@@ -46,6 +46,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/delay.h>
+#include <linux/kthread.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/rwsem.h>
@@ -75,6 +76,9 @@
 #include "ufs.h"
 #include "ufshci.h"
 #include "ufshpb.h"
+#ifdef CONFIG_SCSI_UFS_IMPAIRED
+#include "ufs-impaired.h"
+#endif
 
 #define UFSHCD "ufshcd"
 #define UFSHCD_DRIVER_VERSION "0.3"
@@ -135,8 +139,11 @@ enum uic_link_state {
 #define ufshcd_set_link_off(hba) ((hba)->uic_link_state = UIC_LINK_OFF_STATE)
 #define ufshcd_set_link_active(hba) ((hba)->uic_link_state = \
 				    UIC_LINK_ACTIVE_STATE)
-#define ufshcd_set_link_hibern8(hba) ((hba)->uic_link_state = \
-				    UIC_LINK_HIBERN8_STATE)
+#define ufshcd_set_link_hibern8(hba)					\
+	do {								\
+		((hba)->uic_link_state = UIC_LINK_HIBERN8_STATE);	\
+		(hba)->link_hibern8ed_cnt++;				\
+	} while (0)
 
 enum {
 	/* errors which require the host controller reset for recovery */
@@ -198,6 +205,11 @@ struct ufs_pm_lvl_states {
  * @issue_time_stamp: time stamp for debug purposes
  * @complete_time_stamp: time stamp for statistics
  * @req_abort_skip: skip request abort task flag
+ *
+ * impaired storage related
+ * @list_head: LRB list node head
+ * @complete_delay: target delay in us
+ * @target_complete_time: target completion time with delay emulation.
  */
 struct ufshcd_lrb {
 	struct utp_transfer_req_desc *utr_descriptor_ptr;
@@ -223,6 +235,12 @@ struct ufshcd_lrb {
 	ktime_t complete_time_stamp;
 
 	bool req_abort_skip;
+
+#ifdef CONFIG_SCSI_UFS_IMPAIRED
+	struct list_head list;
+	int complete_delay;
+	ktime_t target_complete_time;
+#endif
 };
 
 /**
@@ -409,6 +427,7 @@ struct ufs_hba_variant {
 /* for manual gc */
 struct ufs_manual_gc {
 	int state;
+	bool hagc_support;
 	struct hrtimer hrtimer;
 	unsigned long delay_ms;
 	struct work_struct hibern8_work;
@@ -668,6 +687,8 @@ struct ufs_stats {
 	int q_depth;
 	int err_stats[UFS_ERR_MAX];
 	struct ufshcd_req_stat req_stats[TS_NUM_STATS];
+	u64 peak_reqs[TS_NUM_STATS];
+	u64 peak_queue_depth;
 	int query_stats_arr[UPIU_QUERY_OPCODE_MAX][MAX_QUERY_IDN];
 	struct ufshcd_io_stat io_read;
 	struct ufshcd_io_stat io_write;
@@ -750,10 +771,13 @@ struct ufshcd_cmd_log_entry {
 	u8 lun;
 	u8 cmd_id;
 	sector_t lba;
-	int transfer_len;
+	u32 transfer_len;
 	u8 idn;		/* used only for query idn */
 	u32 doorbell;
 	u32 outstanding_reqs;
+#ifdef CONFIG_SCSI_UFS_IMPAIRED
+	u32 delayed_reqs;
+#endif
 	u32 seq_num;
 	unsigned int tag;
 	ktime_t tstamp;
@@ -787,6 +811,10 @@ enum ufshcd_slowio_systype {
 	UFSHCD_SLOWIO_CNT = 1,
 	UFSHCD_SLOWIO_SYS_MAX = 2,
 };
+
+#ifdef CONFIG_SCSI_UFS_IMPAIRED
+extern void ufshcd_complete_lrb(struct ufs_hba *hba, struct ufshcd_lrb *lrbp);
+#endif
 
 /**
  * struct ufs_hba - per adapter private structure
@@ -888,6 +916,7 @@ struct ufs_hba {
 	int nutrs;
 	int nutmrs;
 	u32 ufs_version;
+	u32 link_hibern8ed_cnt;
 	struct ufs_hba_variant *var;
 	void *priv;
 	unsigned int irq;
@@ -1099,6 +1128,15 @@ struct ufs_hba {
 	struct work_struct ufshpb_eh_work;
 
 	struct ufs_manual_gc manual_gc;
+
+#ifdef CONFIG_SCSI_UFS_IMPAIRED
+	struct kobject *impaired_kobj;
+	struct ufs_impaired_storage impaired;
+	struct task_struct *impaired_thread;
+	struct mutex impaired_thread_mutex;
+	struct list_head impaired_list_head;
+	unsigned long delayed_reqs;
+#endif
 };
 
 static inline void ufshcd_mark_shutdown_ongoing(struct ufs_hba *hba)
@@ -1320,9 +1358,14 @@ static inline bool ufshcd_is_embedded_dev(struct ufs_hba *hba)
 }
 
 #ifdef CONFIG_DEBUG_FS
+extern u64 ufshcd_prev_sum[TS_NUM_STATS];
+extern u64 ufshcd_prev_count[TS_NUM_STATS];
+
 static inline void ufshcd_init_req_stats(struct ufs_hba *hba)
 {
 	memset(hba->ufs_stats.req_stats, 0, sizeof(hba->ufs_stats.req_stats));
+	memset(ufshcd_prev_sum, 0, sizeof(ufshcd_prev_sum));
+	memset(ufshcd_prev_count, 0, sizeof(ufshcd_prev_count));
 }
 #else
 static inline void ufshcd_init_req_stats(struct ufs_hba *hba) {}

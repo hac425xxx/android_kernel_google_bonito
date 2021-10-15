@@ -41,13 +41,6 @@ static unsigned long __chunk_size = EFI_READ_CHUNK_SIZE;
 #define EFI_ALLOC_ALIGN		EFI_PAGE_SIZE
 #endif
 
-static int __section(.data) __nokaslr;
-
-int __pure nokaslr(void)
-{
-	return __nokaslr;
-}
-
 #define EFI_MMAP_NR_SLACK_SLOTS	8
 
 struct file_info {
@@ -539,7 +532,8 @@ efi_status_t handle_cmdline_files(efi_system_table_t *sys_table_arg,
 			size = files[j].size;
 			while (size) {
 				unsigned long chunksize;
-				if (size > __chunk_size)
+
+				if (IS_ENABLED(CONFIG_X86) && size > __chunk_size)
 					chunksize = __chunk_size;
 				else
 					chunksize = size;

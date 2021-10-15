@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -987,7 +987,7 @@ void dsi_display_esd_irq_mode_switch(struct dsi_display *display,
 		cancel_work_sync(&display->esd_irq_work);
 
 		/* Schedule ESD status check */
-		schedule_delayed_work(&conn->status_work,
+		queue_delayed_work(system_power_efficient_wq, &conn->status_work,
 				msecs_to_jiffies(STATUS_CHECK_INTERVAL_MS));
 		conn->esd_status_check = true;
 	}
@@ -1097,6 +1097,9 @@ static ssize_t debugfs_dump_info_read(struct file *file,
 	len += snprintf(buf + len, (SZ_4K - len),
 			"\tClock master = %s\n",
 			display->ctrl[display->clk_master_idx].ctrl->name);
+
+	if (len > user_len)
+		len = user_len;
 
 	if (copy_to_user(user_buf, buf, len)) {
 		kfree(buf);

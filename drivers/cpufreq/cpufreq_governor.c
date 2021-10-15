@@ -152,7 +152,7 @@ unsigned int dbs_update(struct cpufreq_policy *policy)
 		if (ignore_nice) {
 			u64 cur_nice = kcpustat_cpu(j).cpustat[CPUTIME_NICE];
 
-			idle_time += cputime_to_usecs(cur_nice - j_cdbs->prev_cpu_nice);
+			idle_time += div_u64(cur_nice - j_cdbs->prev_cpu_nice, NSEC_PER_USEC);
 			j_cdbs->prev_cpu_nice = cur_nice;
 		}
 
@@ -265,6 +265,9 @@ static void dbs_update_util_handler(struct update_util_data *data, u64 time,
 	struct cpu_dbs_info *cdbs = container_of(data, struct cpu_dbs_info, update_util);
 	struct policy_dbs_info *policy_dbs = cdbs->policy_dbs;
 	u64 delta_ns, lst;
+
+	if (!cpufreq_can_do_remote_dvfs(policy_dbs->policy))
+		return;
 
 	/*
 	 * The work may not be allowed to be queued up right now.
@@ -448,6 +451,8 @@ int cpufreq_dbs_governor_init(struct cpufreq_policy *policy)
 
 	/* Failure, so roll back. */
 	pr_err("initialization failed (dbs_data kobject init error %d)\n", ret);
+
+	kobject_put(&dbs_data->attr_set.kobj);
 
 	policy->governor_data = NULL;
 

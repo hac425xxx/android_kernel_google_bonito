@@ -251,8 +251,17 @@ static void rtl8187_tx(struct ieee80211_hw *dev,
 	flags |= RTL818X_TX_DESC_FLAG_NO_ENC;
 
 	flags |= ieee80211_get_tx_rate(dev, info)->hw_value << 24;
+
+	// When this flag is set the firmware waits untill ALL fragments have
+	// reached the USB device. Then it sends the first fragment and waits
+	// for ACKS's. Of course in monitor mode it won't detect these ACK's.
 	if (ieee80211_has_morefrags(tx_hdr->frame_control))
-		flags |= RTL818X_TX_DESC_FLAG_MOREFRAG;
+	{
+		// If info->control.vif is NULL it's most likely in monitor mode
+		if (likely(info->control.vif != NULL && info->control.vif->type != NL80211_IFTYPE_MONITOR)) {
+			flags |= RTL818X_TX_DESC_FLAG_MOREFRAG;
+		}
+	}
 
 	/* HW will perform RTS-CTS when only RTS flags is set.
 	 * HW will perform CTS-to-self when both RTS and CTS flags are set.
@@ -446,12 +455,13 @@ static int rtl8187_init_urbs(struct ieee80211_hw *dev)
 		skb_queue_tail(&priv->rx_queue, skb);
 		usb_anchor_urb(entry, &priv->anchored);
 		ret = usb_submit_urb(entry, GFP_KERNEL);
-		usb_put_urb(entry);
 		if (ret) {
 			skb_unlink(skb, &priv->rx_queue);
 			usb_unanchor_urb(entry);
+			usb_put_urb(entry);
 			goto err;
 		}
+		usb_put_urb(entry);
 	}
 	return ret;
 

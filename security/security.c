@@ -914,6 +914,13 @@ int security_cred_alloc_blank(struct cred *cred, gfp_t gfp)
 
 void security_cred_free(struct cred *cred)
 {
+	/*
+	 * There is a failure case in prepare_creds() that
+	 * may result in a call here with ->security being NULL.
+	 */
+	if (unlikely(cred->security == NULL))
+		return;
+
 	call_void_hook(cred_free, cred);
 }
 
@@ -1033,11 +1040,6 @@ int security_task_kill(struct task_struct *p, struct siginfo *info,
 			int sig, u32 secid)
 {
 	return call_int_hook(task_kill, 0, p, info, sig, secid);
-}
-
-int security_task_wait(struct task_struct *p)
-{
-	return call_int_hook(task_wait, 0, p);
 }
 
 int security_task_prctl(int option, unsigned long arg2, unsigned long arg3,
@@ -1630,6 +1632,33 @@ void security_bpf_prog_free(struct bpf_prog_aux *aux)
 }
 #endif /* CONFIG_BPF_SYSCALL */
 
+#ifdef CONFIG_PERF_EVENTS
+int security_perf_event_open(struct perf_event_attr *attr, int type)
+{
+	return call_int_hook(perf_event_open, 0, attr, type);
+}
+
+int security_perf_event_alloc(struct perf_event *event)
+{
+	return call_int_hook(perf_event_alloc, 0, event);
+}
+
+void security_perf_event_free(struct perf_event *event)
+{
+	call_void_hook(perf_event_free, event);
+}
+
+int security_perf_event_read(struct perf_event *event)
+{
+	return call_int_hook(perf_event_read, 0, event);
+}
+
+int security_perf_event_write(struct perf_event *event)
+{
+	return call_int_hook(perf_event_write, 0, event);
+}
+#endif /* CONFIG_PERF_EVENTS */
+
 struct security_hook_heads security_hook_heads __lsm_ro_after_init = {
 	.binder_set_context_mgr =
 		LIST_HEAD_INIT(security_hook_heads.binder_set_context_mgr),
@@ -1812,7 +1841,6 @@ struct security_hook_heads security_hook_heads __lsm_ro_after_init = {
 	.task_movememory =
 		LIST_HEAD_INIT(security_hook_heads.task_movememory),
 	.task_kill =	LIST_HEAD_INIT(security_hook_heads.task_kill),
-	.task_wait =	LIST_HEAD_INIT(security_hook_heads.task_wait),
 	.task_prctl =	LIST_HEAD_INIT(security_hook_heads.task_prctl),
 	.task_to_inode =
 		LIST_HEAD_INIT(security_hook_heads.task_to_inode),
@@ -1999,4 +2027,16 @@ struct security_hook_heads security_hook_heads __lsm_ro_after_init = {
 	.bpf_prog_free_security =
 		LIST_HEAD_INIT(security_hook_heads.bpf_prog_free_security),
 #endif /* CONFIG_BPF_SYSCALL */
+#ifdef CONFIG_PERF_EVENTS
+	.perf_event_open =
+		LIST_HEAD_INIT(security_hook_heads.perf_event_open),
+	.perf_event_alloc =
+		LIST_HEAD_INIT(security_hook_heads.perf_event_alloc),
+	.perf_event_free =
+		LIST_HEAD_INIT(security_hook_heads.perf_event_free),
+	.perf_event_read =
+		LIST_HEAD_INIT(security_hook_heads.perf_event_read),
+	.perf_event_write =
+		LIST_HEAD_INIT(security_hook_heads.perf_event_write),
+#endif /* CONFIG_PERF_EVENTS */
 };

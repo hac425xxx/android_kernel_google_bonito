@@ -98,8 +98,15 @@
 
 	bootloader_log {
 		compatible = "qcom,bldr_log";
-		reg = <0xA1800000 0x6000>, <0xA1806000 0x6000>;
+		reg = <0xA1800000 0x5C00>, <0xA1806000 0x5C00>;
 		reg-names = "bl_log", "bl_old_log";
+		memory-region = <&debug_info>;
+	};
+
+	bootloader_kinfo {
+		compatible = "bootloader_kinfo";
+		reg = <0xA1805C00 0x3C0>;
+		reg-names = "kinfo";
 		memory-region = <&debug_info>;
 	};
 
@@ -122,6 +129,13 @@
 		compatible = "access_ramoops";
 		label = "ramoops";
 		memory-region = <&alt_ramoops_mem>;
+	};
+
+	keydebug {
+		compatible = "keydebug";
+		key_down_delay = <7000>;
+		keys_down = <116>;
+		dbg_fn_delay = <2500>;
 	};
 };
 
@@ -182,24 +196,6 @@
 	status = "ok";
 };
 
-&android_fstab {
-	product {
-		compatible = "android,product";
-		dev = "/dev/block/platform/soc/1d84000.ufshc/by-name/product";
-		type = "ext4";
-		mnt_flags = "ro";
-		fsmgr_flags = "wait,slotselect,avb";
-	};
-};
-
-&qcom_ion {
-	qcom,ion-heap@30 {
-		reg = <30>;
-		memory-region = <&easel_mem>;
-		qcom,ion-heap-type = "CARVEOUT";
-	};
-};
-
 &thermal_zones {
 	vbat_too_low {
 		trips {
@@ -225,4 +221,9 @@
 			};
 		};
 	};
+};
+
+// Force warm reboot on 'shutdown,thermal'
+&msm_poweroff {
+	qcom,force-warm-reboot-on-thermal-shutdown;
 };

@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2018 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2016-2019 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -367,6 +367,12 @@ static int smb2_parse_dt(struct smb2 *chip)
 				     &chg->usb_port_tz_name);
 	if (rc < 0)
 		pr_err("cannot read usb-port-tz-name, rc=%d\n", rc);
+
+	chg->disable_stat_sw_override = of_property_read_bool(node,
+					"qcom,disable-stat-sw-override");
+
+	chg->fcc_stepper_enable = of_property_read_bool(node,
+					"qcom,fcc-stepping-enable");
 
 	return 0;
 }
@@ -1040,6 +1046,12 @@ static int smb2_init_dc_psy(struct smb2 *chip)
 		pr_err("Failed to set DCIN_AICL_REF_SEL_CFG_REG (%d)\n", rc);
 		return rc;
 	}
+	rc = smblib_masked_write(chg, DCIN_AICL_OPTIONS_CFG_REG,
+				 DCIN_AICL_ADC_EN_BIT, 0);
+	if (rc < 0) {
+		pr_err("Failed to set DCIN_AICL_OPTIONS_CFG_REG (%d)\n", rc);
+		return rc;
+	}
 #endif
 
 	return 0;
@@ -1065,6 +1077,7 @@ static enum power_supply_property smb2_batt_props[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CURRENT_QNOVO,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_STEP_CHARGING_ENABLED,
@@ -1085,6 +1098,7 @@ static enum power_supply_property smb2_batt_props[] = {
 #ifndef CONFIG_QPNP_FG_GEN3_LEGACY_CYCLE_COUNT
 	POWER_SUPPLY_PROP_CYCLE_COUNT,
 #endif
+	POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE,
 };
 
 static int smb2_batt_get_prop(struct power_supply *psy,
@@ -1107,7 +1121,10 @@ static int smb2_batt_get_prop(struct power_supply *psy,
 		rc = smblib_get_prop_batt_status(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_HEALTH:
-		rc = smblib_get_prop_batt_health(chg, val);
+		if (chg->batt_health != POWER_SUPPLY_HEALTH_UNKNOWN)
+			val->intval = chg->batt_health;
+		else
+			rc = smblib_get_prop_batt_health(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		rc = smblib_get_prop_batt_present(chg, val);
@@ -1152,9 +1169,6 @@ static int smb2_batt_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_TAPER_CONTROL:
 		val->intval = chg->taper_control_enabled;
 		break;
-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		rc = smblib_get_prop_batt_voltage_now(chg, val);
-		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
 		val->intval = get_client_vote(chg->fv_votable,
 				BATT_PROFILE_VOTER);
@@ -1166,9 +1180,6 @@ static int smb2_batt_get_prop(struct power_supply *psy,
 		val->intval = get_client_vote_locked(chg->fv_votable,
 				QNOVO_VOTER);
 		break;
-	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		rc = smblib_get_prop_batt_current_now(chg, val);
-		break;
 	case POWER_SUPPLY_PROP_CURRENT_QNOVO:
 		val->intval = get_client_vote_locked(chg->fcc_votable,
 				QNOVO_VOTER);
@@ -1177,8 +1188,9 @@ static int smb2_batt_get_prop(struct power_supply *psy,
 		val->intval = get_client_vote(chg->fcc_votable,
 					      BATT_PROFILE_VOTER);
 		break;
-	case POWER_SUPPLY_PROP_TEMP:
-		rc = smblib_get_prop_batt_temp(chg, val);
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		val->intval = get_client_vote(chg->fcc_votable,
+					      FG_ESR_VOTER);
 		break;
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
@@ -1210,7 +1222,17 @@ static int smb2_batt_get_prop(struct power_supply *psy,
 		val->intval = 0;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
-		rc = smblib_get_prop_batt_charge_counter(chg, val);
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+	case POWER_SUPPLY_PROP_TEMP:
+		rc = smblib_get_prop_from_bms(chg, psp, val);
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		 rc = smblib_get_prop_from_bms(chg, psp, val);
+		if (!rc)
+			val->intval *= (-1);
+		break;
+	case POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE:
+		val->intval = chg->fcc_stepper_enable;
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_MAX:
 		rc = smblib_get_prop_input_current_max(chg, val);
@@ -1314,6 +1336,12 @@ static int smb2_batt_set_prop(struct power_supply *psy,
 		vote(chg->chg_disable_votable, USER_VOTER,
 			(bool)val->intval, 0);
 		break;
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		if (val->intval)
+			vote(chg->fcc_votable, FG_ESR_VOTER, true, val->intval);
+		else
+			vote(chg->fcc_votable, FG_ESR_VOTER, false, 0);
+		break;
 	case POWER_SUPPLY_PROP_SET_SHIP_MODE:
 		/* Not in ship mode as long as the device is active */
 		if (!val->intval)
@@ -1338,6 +1366,9 @@ static int smb2_batt_set_prop(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_MAX:
 		rc = smblib_set_prop_input_current_max(chg, val);
+		break;
+	case POWER_SUPPLY_PROP_HEALTH:
+		chg->batt_health = val->intval;
 		break;
 	default:
 		rc = -EINVAL;
@@ -1366,6 +1397,7 @@ static int smb2_batt_prop_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
 	case POWER_SUPPLY_PROP_CHARGE_DISABLE:
+	case POWER_SUPPLY_PROP_HEALTH:
 		return 1;
 	default:
 		break;
@@ -1607,6 +1639,13 @@ static int smb2_configure_typec(struct smb_charger *chg)
 		dev_err(chg->dev, "Couldn't set Type-C config rc=%d\n", rc);
 		return rc;
 	}
+
+	/* Set CC threshold to 1.6 V in source mode */
+	rc = smblib_masked_write(chg, TYPE_C_CFG_2_REG, DFP_CC_1P4V_OR_1P6V_BIT,
+				 DFP_CC_1P4V_OR_1P6V_BIT);
+	if (rc < 0)
+		dev_err(chg->dev,
+			"Couldn't configure CC threshold voltage rc=%d\n", rc);
 
 	return rc;
 }
@@ -1995,6 +2034,16 @@ static int smb2_init_hw(struct smb2 *chip)
 		rc = smblib_disable_hw_jeita(chg, true);
 		if (rc < 0) {
 			dev_err(chg->dev, "Couldn't set hw jeita rc=%d\n", rc);
+			return rc;
+		}
+	}
+
+	if (chg->disable_stat_sw_override) {
+		rc = smblib_masked_write(chg, STAT_CFG_REG,
+				STAT_SW_OVERRIDE_CFG_BIT, 0);
+		if (rc < 0) {
+			dev_err(chg->dev, "Couldn't disable STAT SW override rc=%d\n",
+				rc);
 			return rc;
 		}
 	}
@@ -2488,6 +2537,7 @@ static int smb2_probe(struct platform_device *pdev)
 	chg->taper_control_enabled = POWER_SUPPLY_TAPER_CONTROL_MODE_STEPPER;
 	chg->name = "PMI";
 	chg->audio_headset_drp_wait_ms = &__audio_headset_drp_wait_ms;
+	chg->batt_health = POWER_SUPPLY_HEALTH_UNKNOWN;
 
 	chg->regmap = dev_get_regmap(chg->dev->parent, NULL);
 	if (!chg->regmap) {
@@ -2500,6 +2550,13 @@ static int smb2_probe(struct platform_device *pdev)
 		if (rc != -EPROBE_DEFER)
 			pr_err("Couldn't setup chg_config rc=%d\n", rc);
 		return rc;
+	}
+
+	chg->log = debugfs_logbuffer_register("smblib");
+	if (!chg->log) {
+		pr_err("failed to obtain logbuffer instance rc:%ld",
+		       PTR_ERR(chg->log));
+		return PTR_ERR(chg->log);
 	}
 
 	rc = smb2_parse_dt(chip);
@@ -2657,6 +2714,7 @@ cleanup:
 		devm_regulator_unregister(chg->dev, chg->vbus_vreg->rdev);
 
 	smblib_deinit(chg);
+	debugfs_logbuffer_unregister(chg->log);
 
 	platform_set_drvdata(pdev, NULL);
 	return rc;

@@ -28,7 +28,6 @@ struct class *sec_class;
 #ifdef USE_POWER_RESET_WORK
 static void sec_ts_reset_work(struct work_struct *work);
 #endif
-static void sec_ts_read_info_work(struct work_struct *work);
 static void sec_ts_fw_update_work(struct work_struct *work);
 static void sec_ts_suspend_work(struct work_struct *work);
 static void sec_ts_resume_work(struct work_struct *work);
@@ -449,25 +448,35 @@ void sec_ts_delay(unsigned int ms)
 
 int sec_ts_wait_for_ready(struct sec_ts_data *ts, unsigned int ack)
 {
+	return sec_ts_wait_for_ready_with_count(ts, ack,
+						SEC_TS_WAIT_RETRY_CNT);
+}
+
+int sec_ts_wait_for_ready_with_count(struct sec_ts_data *ts, unsigned int ack,
+				     unsigned int count)
+{
 	int rc = -1;
 	int retry = 0;
 	u8 tBuff[SEC_TS_EVENT_BUFF_SIZE] = {0,};
 
-	while (sec_ts_i2c_read(ts, SEC_TS_READ_ONE_EVENT, tBuff, SEC_TS_EVENT_BUFF_SIZE)) {
+	while (sec_ts_i2c_read(ts, SEC_TS_READ_ONE_EVENT, tBuff,
+				SEC_TS_EVENT_BUFF_SIZE)) {
 		if (((tBuff[0] >> 2) & 0xF) == TYPE_STATUS_EVENT_INFO) {
 			if (tBuff[1] == ack) {
 				rc = 0;
 				break;
 			}
-		} else if (((tBuff[0] >> 2) & 0xF) == TYPE_STATUS_EVENT_VENDOR_INFO) {
+		} else if (((tBuff[0] >> 2) & 0xF)
+				== TYPE_STATUS_EVENT_VENDOR_INFO) {
 			if (tBuff[1] == ack) {
 				rc = 0;
 				break;
 			}
 		}
 
-		if (retry++ > SEC_TS_WAIT_RETRY_CNT) {
-			input_err(true, &ts->client->dev, "%s: Time Over\n", __func__);
+		if (retry++ > count) {
+			input_err(true, &ts->client->dev, "%s: Time Over\n",
+				__func__);
 			break;
 		}
 		sec_ts_delay(20);
@@ -602,6 +611,74 @@ static void sec_ts_reinit(struct sec_ts_data *ts)
 
 	}
 	return;
+}
+
+static bool read_heatmap_raw(struct v4l2_heatmap *v4l2, strength_t *data)
+{
+	struct sec_ts_data *ts = container_of(v4l2, struct sec_ts_data, v4l2);
+
+	unsigned int num_elements;
+	/* index for looping through the heatmap buffer read over the bus */
+	unsigned int local_i;
+
+	int result;
+
+	strength_t heatmap_value;
+	/* final position of the heatmap value in the full heatmap frame */
+	unsigned int frame_i;
+	int heatmap_x, heatmap_y;
+	int max_x = v4l2->format.width;
+	int max_y = v4l2->format.height;
+
+	struct heatmap_report report = {0};
+
+	result = sec_ts_i2c_read(ts, SEC_TS_CMD_HEATMAP_READ,
+		(uint8_t *) &report, sizeof(report));
+	if (result < 0) {
+		input_err(true, &ts->client->dev,
+			 "%s: i2c read failed, sec_ts_i2c_read returned %i\n",
+			__func__, result);
+		return false;
+	}
+
+	num_elements = report.size_x * report.size_y;
+	if (num_elements > LOCAL_HEATMAP_WIDTH * LOCAL_HEATMAP_HEIGHT) {
+		input_err(true, &ts->client->dev,
+			"Unexpected heatmap size: %i x %i",
+			report.size_x, report.size_y);
+			return false;
+	}
+
+	/* set all to zero, will only write to non-zero locations in the loop */
+	memset(data, 0, max_x * max_y * sizeof(data[0]));
+	/* populate the data buffer, rearranging into final locations */
+	for (local_i = 0; local_i < num_elements; local_i++) {
+		/* enforce big-endian order */
+		be16_to_cpus(&report.data[local_i]);
+		heatmap_value = report.data[local_i];
+
+		if (heatmap_value == 0) {
+			/*
+			 * Already initialized to zero. More importantly,
+			 * samples around edges may go out of bounds.
+			 * If their value is zero, this is ok.
+			 */
+			continue;
+		}
+		heatmap_x = report.offset_x + (local_i % report.size_x);
+		heatmap_y = report.offset_y + (local_i / report.size_x);
+
+		if (heatmap_x < 0 || heatmap_x >= max_x ||
+			heatmap_y < 0 || heatmap_y >= max_y) {
+				input_err(true, &ts->client->dev,
+					"Invalid x or y: (%i, %i), value=%i, ending loop\n",
+					heatmap_x, heatmap_y, heatmap_value);
+				return false;
+		}
+		frame_i = heatmap_y * max_x + heatmap_x;
+		data[frame_i] = heatmap_value;
+	};
+	return true;
 }
 
 #define MAX_EVENT_COUNT 32
@@ -1019,6 +1096,18 @@ static void sec_ts_read_event(struct sec_ts_data *ts)
 	} while (remain_event_count >= 0);
 
 	input_sync(ts->input_dev);
+
+	heatmap_read(&ts->v4l2, ktime_to_ns(ts->timestamp));
+}
+
+static irqreturn_t sec_ts_isr(int irq, void *handle)
+{
+	struct sec_ts_data *ts = (struct sec_ts_data *)handle;
+
+	ts->timestamp = ktime_get();
+	input_set_timestamp(ts->input_dev, ts->timestamp);
+
+	return IRQ_WAKE_THREAD;
 }
 
 static irqreturn_t sec_ts_irq_thread(int irq, void *ptr)
@@ -1028,8 +1117,8 @@ static irqreturn_t sec_ts_irq_thread(int irq, void *ptr)
 	if (sec_ts_set_bus_ref(ts, SEC_TS_BUS_REF_IRQ, true) < 0) {
 		/* Interrupt during bus suspend */
 		input_info(true, &ts->client->dev,
-			   "%s: Skipping stray interrupt since bus is suspended.\n",
-			   __func__);
+		   "%s: Skipping stray interrupt since bus is suspended(power_status: %d)\n",
+			   __func__, ts->power_status);
 		return IRQ_HANDLED;
 	}
 
@@ -1405,6 +1494,22 @@ static int sec_ts_parse_dt(struct i2c_client *client)
 			  __func__);
 	}
 
+	pdata->reset_gpio = of_get_named_gpio(np, "sec,reset_gpio", 0);
+	if (gpio_is_valid(pdata->reset_gpio)) {
+		ret = gpio_request_one(pdata->reset_gpio,
+					GPIOF_OUT_INIT_HIGH,
+					"sec,touch_reset_gpio");
+		if (ret) {
+			input_err(true, dev,
+				  "%s: Failed to request gpio %d, ret %d\n",
+				  __func__, pdata->reset_gpio, ret);
+			pdata->reset_gpio = -1;
+		}
+
+	} else
+		input_err(true, dev, "%s: Failed to get reset_gpio\n",
+			__func__);
+
 	count = of_property_count_strings(np, "sec,firmware_name");
 	if (count <= 0) {
 		pdata->firmware_name = NULL;
@@ -1451,7 +1556,7 @@ static int sec_ts_parse_dt(struct i2c_client *client)
 
 	input_info(true, &client->dev, "%s: lcdtype 0x%08X\n", __func__, lcdtype);
 
-	if (strncmp(pdata->model_name, "G950", 4) == 0)
+	if (pdata->model_name && strncmp(pdata->model_name, "G950", 4) == 0)
 		pdata->panel_revision = 0;
 	else
 		pdata->panel_revision = ((lcdtype >> 8) & 0xFF) >> 4;
@@ -1892,18 +1997,36 @@ static int sec_ts_probe(struct i2c_client *client,
 #ifdef USE_POWER_RESET_WORK
 	INIT_DELAYED_WORK(&ts->reset_work, sec_ts_reset_work);
 #endif
-	INIT_DELAYED_WORK(&ts->work_read_info, sec_ts_read_info_work);
 	INIT_WORK(&ts->suspend_work, sec_ts_suspend_work);
 	INIT_WORK(&ts->resume_work, sec_ts_resume_work);
+	ts->event_wq = alloc_workqueue("sec_ts-event-queue", WQ_UNBOUND |
+					 WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
+	if (!ts->event_wq) {
+		input_err(true, &ts->client->dev,
+			"%s: Cannot create work thread\n", __func__);
+		ret = -ENOMEM;
+		goto error_alloc_workqueue;
+	}
 
 	init_completion(&ts->bus_resumed);
 	complete_all(&ts->bus_resumed);
 
 #ifdef SEC_TS_FW_UPDATE_ON_PROBE
-	INIT_WORK(&ts->work_fw_update, sec_ts_fw_update_work);
+	INIT_WORK(&ts->fw_update_work, sec_ts_fw_update_work);
 #else
 	input_info(true, &ts->client->dev, "%s: fw update on probe disabled!\n",
 		   __func__);
+	ts->fw_update_wq = alloc_workqueue("sec_ts-fw-update-queue",
+					    WQ_UNBOUND | WQ_HIGHPRI |
+					    WQ_CPU_INTENSIVE, 1);
+	if (!ts->fw_update_wq) {
+		input_err(true, &ts->client->dev,
+			  "%s: Can't alloc fw update work thread\n",
+			  __func__);
+		ret = -ENOMEM;
+		goto error_alloc_fw_update_wq;
+	}
+	INIT_DELAYED_WORK(&ts->fw_update_work, sec_ts_fw_update_work);
 #endif
 
 	ts->is_fw_corrupted = false;
@@ -1982,9 +2105,25 @@ static int sec_ts_probe(struct i2c_client *client,
 
 	ret = sec_ts_wait_for_ready(ts, SEC_TS_ACK_BOOT_COMPLETE);
 	if (ret < 0) {
-		input_err(true, &ts->client->dev,
-			  "%s: failed to communicate with touch controller. Try to update FW to recover!\n",
-			  __func__);
+		u8 boot_status;
+		/* Read the boot status in case device is in bootloader mode */
+		ret = ts->sec_ts_i2c_read(ts, SEC_TS_READ_BOOT_STATUS,
+					  &boot_status, 1);
+		if (ret < 0) {
+			input_err(true, &ts->client->dev,
+				  "%s: could not read boot status. Assuming no device connected.\n",
+				  __func__);
+			goto err_init;
+		}
+
+		input_info(true, &ts->client->dev,
+			   "%s: Attempting to reflash the firmware. Boot status = 0x%02X\n",
+			   __func__, boot_status);
+		if (boot_status != SEC_TS_STATUS_BOOT_MODE)
+			input_err(true, &ts->client->dev,
+				  "%s: device is not in bootloader mode!\n",
+				  __func__);
+
 		ts->is_fw_corrupted = true;
 	}
 
@@ -2005,16 +2144,39 @@ static int sec_ts_probe(struct i2c_client *client,
 		}
 	}
 
-	input_info(true, &ts->client->dev, "%s: request_irq = %d\n", __func__, client->irq);
-
 	pm_qos_add_request(&ts->pm_qos_req, PM_QOS_CPU_DMA_LATENCY,
 		PM_QOS_DEFAULT_VALUE);
 
-	ret = request_threaded_irq(client->irq, NULL, sec_ts_irq_thread,
+	/*
+	 * Heatmap_probe must be called before irq routine is registered,
+	 * because heatmap_read is called from the irq context.
+	 * If the ISR runs before heatmap_probe is finished, it will invoke
+	 * heatmap_read and cause NPE, since read_frame would not yet be set.
+	 */
+	ts->v4l2.parent_dev = &ts->client->dev;
+	ts->v4l2.input_dev = ts->input_dev;
+	ts->v4l2.read_frame = read_heatmap_raw;
+	ts->v4l2.width = ts->tx_count;
+	ts->v4l2.height = ts->rx_count;
+	/* 120 Hz operation */
+	ts->v4l2.timeperframe.numerator = 1;
+	ts->v4l2.timeperframe.denominator = 120;
+	ret = heatmap_probe(&ts->v4l2);
+	if (ret) {
+		input_err(true, &ts->client->dev,
+			"%s: Heatmap probe failed\n", __func__);
+		goto err_irq;
+	}
+
+	input_info(true, &ts->client->dev, "%s: request_irq = %d\n", __func__,
+			client->irq);
+
+	ret = request_threaded_irq(client->irq, sec_ts_isr, sec_ts_irq_thread,
 			ts->plat_data->irq_type, SEC_TS_I2C_NAME, ts);
 	if (ret < 0) {
-		input_err(true, &ts->client->dev, "%s: Unable to request threaded irq\n", __func__);
-		goto err_irq;
+		input_err(true, &ts->client->dev,
+			"%s: Unable to request threaded irq\n", __func__);
+		goto err_heatmap;
 	}
 
 	ts->notifier = sec_ts_screen_nb;
@@ -2036,15 +2198,14 @@ static int sec_ts_probe(struct i2c_client *client,
 		sec_ts_device_init(ts);
 
 #ifdef SEC_TS_FW_UPDATE_ON_PROBE
-	schedule_work(&ts->work_fw_update);
+	schedule_work(&ts->fw_update_work);
 
 	/* Do not finish probe without checking and flashing the firmware */
-	flush_work(&ts->work_fw_update);
+	flush_work(&ts->fw_update_work);
+#else
+	queue_delayed_work(ts->fw_update_wq, &ts->fw_update_work,
+		    msecs_to_jiffies(SEC_TS_FW_UPDATE_DELAY_MS_AFTER_PROBE));
 #endif
-
-	if (ts->is_fw_corrupted == false)
-		schedule_delayed_work(&ts->work_read_info,
-				      msecs_to_jiffies(5000));
 
 #if defined(CONFIG_TOUCHSCREEN_DUMP_MODE)
 	dump_callbacks.inform_dump = dump_tsp_log;
@@ -2067,6 +2228,8 @@ static int sec_ts_probe(struct i2c_client *client,
 */
 err_register_drm_client:
 	free_irq(client->irq, ts);
+err_heatmap:
+	heatmap_remove(&ts->v4l2);
 err_irq:
 	pm_qos_remove_request(&ts->pm_qos_req);
 	if (ts->plat_data->support_dex) {
@@ -2096,6 +2259,16 @@ err_allocate_input_dev:
 	tbn_cleanup(ts->tbn);
 err_init_tbn:
 #endif
+
+#ifndef SEC_TS_FW_UPDATE_ON_PROBE
+	if (ts->fw_update_wq)
+		destroy_workqueue(ts->fw_update_wq);
+error_alloc_fw_update_wq:
+#endif
+
+	if (ts->event_wq)
+		destroy_workqueue(ts->event_wq);
+error_alloc_workqueue:
 	kfree(ts);
 
 error_allocate_mem:
@@ -2107,6 +2280,8 @@ error_allocate_mem:
 		gpio_free(pdata->tsp_icid);
 	if (gpio_is_valid(pdata->switch_gpio))
 		gpio_free(pdata->switch_gpio);
+	if (gpio_is_valid(pdata->reset_gpio))
+		gpio_free(pdata->reset_gpio);
 
 error_allocate_pdata:
 	if (ret == -ECONNREFUSED)
@@ -2275,10 +2450,8 @@ static void sec_ts_reset_work(struct work_struct *work)
 }
 #endif
 
-static void sec_ts_read_info_work(struct work_struct *work)
+void sec_ts_read_init_info(struct sec_ts_data *ts)
 {
-	struct sec_ts_data *ts = container_of(work, struct sec_ts_data,
-							work_read_info.work);
 #ifndef CONFIG_SEC_FACTORY
 	struct sec_ts_test_mode mode;
 	char para = TO_TOUCH_MODE;
@@ -2290,14 +2463,22 @@ static void sec_ts_read_info_work(struct work_struct *work)
 
 	ts->nv = get_tsp_nvm_data(ts, SEC_TS_NVM_OFFSET_FAC_RESULT);
 	ts->cal_count = get_tsp_nvm_data(ts, SEC_TS_NVM_OFFSET_CAL_COUNT);
-	ts->pressure_cal_base = get_tsp_nvm_data(ts, SEC_TS_NVM_OFFSET_PRESSURE_BASE_CAL_COUNT);
-	ts->pressure_cal_delta = get_tsp_nvm_data(ts, SEC_TS_NVM_OFFSET_PRESSURE_DELTA_CAL_COUNT);
+	ts->pressure_cal_base = get_tsp_nvm_data(ts,
+				SEC_TS_NVM_OFFSET_PRESSURE_BASE_CAL_COUNT);
+	ts->pressure_cal_delta = get_tsp_nvm_data(ts,
+				SEC_TS_NVM_OFFSET_PRESSURE_DELTA_CAL_COUNT);
 
-	input_info(true, &ts->client->dev, "%s: fac_nv:%02X, cal_count:%02X\n", __func__, ts->nv, ts->cal_count);
+	input_info(true, &ts->client->dev,
+		    "%s: fac_nv:%02X, cal_count:%02X\n",
+		    __func__, ts->nv, ts->cal_count);
 
 #ifdef PAT_CONTROL
-	ts->tune_fix_ver = (get_tsp_nvm_data(ts, SEC_TS_NVM_OFFSET_TUNE_VERSION) << 8) | get_tsp_nvm_data(ts, SEC_TS_NVM_OFFSET_TUNE_VERSION+1);
-	input_info(true, &ts->client->dev, "%s: tune_fix_ver [%04X]\n", __func__, ts->tune_fix_ver);
+	ts->tune_fix_ver = (get_tsp_nvm_data(ts,
+				SEC_TS_NVM_OFFSET_TUNE_VERSION) << 8) |
+			    get_tsp_nvm_data(ts,
+				SEC_TS_NVM_OFFSET_TUNE_VERSION + 1);
+	input_info(true, &ts->client->dev,
+	    "%s: tune_fix_ver [%04X]\n", __func__, ts->tune_fix_ver);
 #endif
 
 #ifdef USE_PRESSURE_SENSOR
@@ -2308,8 +2489,9 @@ static void sec_ts_read_info_work(struct work_struct *work)
 	ts->pressure_left = ((data[16] << 8) | data[17]);
 	ts->pressure_center = ((data[8] << 8) | data[9]);
 	ts->pressure_right = ((data[0] << 8) | data[1]);
-	input_info(true, &ts->client->dev, "%s: left: %d, center: %d, right: %d\n",
-		__func__, ts->pressure_left, ts->pressure_center, ts->pressure_right);
+	input_info(true, &ts->client->dev,
+		"%s: left: %d, center: %d, right: %d\n", __func__,
+		ts->pressure_left, ts->pressure_center, ts->pressure_right);
 #endif
 
 #ifndef CONFIG_SEC_FACTORY
@@ -2324,7 +2506,8 @@ static void sec_ts_read_info_work(struct work_struct *work)
 
 	ret = ts->sec_ts_i2c_write(ts, SEC_TS_CMD_SET_POWER_MODE, &para, 1);
 	if (ret < 0)
-		 input_err(true, &ts->client->dev, "%s: Failed to set\n", __func__);
+		input_err(true, &ts->client->dev, "%s: Failed to set\n",
+				__func__);
 
 	sec_ts_delay(350);
 
@@ -2341,8 +2524,16 @@ static void sec_ts_read_info_work(struct work_struct *work)
 
 static void sec_ts_fw_update_work(struct work_struct *work)
 {
+#ifdef SEC_TS_FW_UPDATE_ON_PROBE
 	struct sec_ts_data *ts = container_of(work, struct sec_ts_data,
-					      work_fw_update);
+					      fw_update_work);
+#else
+	struct delayed_work *fw_update_work = container_of(work,
+					struct delayed_work, work);
+	struct sec_ts_data *ts = container_of(fw_update_work,
+					struct sec_ts_data, fw_update_work);
+#endif
+
 	int ret;
 
 	input_info(true, &ts->client->dev,
@@ -2361,13 +2552,14 @@ static void sec_ts_fw_update_work(struct work_struct *work)
 		if (ret == SEC_TS_ERR_NA) {
 			ts->is_fw_corrupted = false;
 			sec_ts_device_init(ts);
-			sec_ts_read_info_work(&ts->work_read_info.work);
 		} else
 			input_info(true, &ts->client->dev,
 				"%s: fail to sec_ts_fw_init 0x%x\n",
 				__func__, ret);
 	}
 
+	if (ts->is_fw_corrupted == false)
+		sec_ts_read_init_info(ts);
 	sec_ts_set_bus_ref(ts, SEC_TS_BUS_REF_FW_UPDATE, false);
 }
 
@@ -2511,17 +2703,20 @@ static int sec_ts_remove(struct i2c_client *client)
 
 	cancel_work_sync(&ts->suspend_work);
 	cancel_work_sync(&ts->resume_work);
+	destroy_workqueue(ts->event_wq);
 
 #ifdef SEC_TS_FW_UPDATE_ON_PROBE
-	cancel_work_sync(&ts->work_fw_update);
+	cancel_work_sync(&ts->fw_update_work);
+#else
+	cancel_delayed_work_sync(&ts->fw_update_work);
+	destroy_workqueue(ts->fw_update_wq);
 #endif
-
-	cancel_delayed_work_sync(&ts->work_read_info);
-	flush_delayed_work(&ts->work_read_info);
 
 	disable_irq_nosync(ts->client->irq);
 	free_irq(ts->client->irq, ts);
 	input_info(true, &ts->client->dev, "%s: irq disabled\n", __func__);
+
+	heatmap_remove(&ts->v4l2);
 
 	pm_qos_remove_request(&ts->pm_qos_req);
 
@@ -2570,6 +2765,8 @@ static int sec_ts_remove(struct i2c_client *client)
 		gpio_free(ts->plat_data->irq_gpio);
 	if (gpio_is_valid(ts->plat_data->switch_gpio))
 		gpio_free(ts->plat_data->switch_gpio);
+	if (gpio_is_valid(ts->plat_data->reset_gpio))
+		gpio_free(ts->plat_data->reset_gpio);
 
 	sec_ts_raw_device_exit(ts);
 #ifndef CONFIG_SEC_SYSFS
@@ -2838,10 +3035,10 @@ static void sec_ts_resume_work(struct work_struct *work)
 
 	ts->power_status = SEC_TS_STATE_POWER_ON;
 
-	ret = sec_ts_sw_reset(ts);
+	ret = sec_ts_system_reset(ts);
 	if (ret < 0)
 		input_err(true, &ts->client->dev,
-			  "%s: software reset failed!\n", __func__);
+			"%s: reset failed! ret %d\n", __func__, ret);
 
 	if (ts->plat_data->enable_sync)
 		ts->plat_data->enable_sync(true);
@@ -2922,9 +3119,9 @@ static void sec_ts_aggregate_bus_state(struct sec_ts_data *ts)
 		return;
 
 	if (ts->bus_refmask == 0)
-		schedule_work(&ts->suspend_work);
+		queue_work(ts->event_wq, &ts->suspend_work);
 	else
-		schedule_work(&ts->resume_work);
+		queue_work(ts->event_wq, &ts->resume_work);
 }
 
 int sec_ts_set_bus_ref(struct sec_ts_data *ts, u16 ref, bool enable)
@@ -2995,6 +3192,9 @@ static int sec_ts_screen_state_chg_callback(struct notifier_block *nb,
 			  __func__);
 		return NOTIFY_DONE;
 	}
+
+	/* finish processing any events on queue */
+	flush_workqueue(ts->event_wq);
 
 	blank = *((unsigned int *)evdata->data);
 	switch (blank) {

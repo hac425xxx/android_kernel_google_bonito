@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -27,7 +27,7 @@
 #include "adsp_err.h"
 
 #if defined(CONFIG_CIRRUS_SPKR_PROTECTION)
-#include <dsp/msm-cirrus-playback.h>
+#include <asoc/msm-cirrus-playback.h>
 #endif
 
 #define WAKELOCK_TIMEOUT	5000
@@ -127,7 +127,7 @@ struct afe_ctl {
 	int dev_acdb_id[AFE_MAX_PORTS];
 	routing_cb rt_cb;
 };
-
+extern int msm_pcm_routing_is_flick_port(int port_id);
 static atomic_t afe_ports_mad_type[SLIMBUS_PORT_LAST - SLIMBUS_0_RX];
 static unsigned long afe_configured_cmd;
 
@@ -294,6 +294,15 @@ static int32_t sp_make_afe_callback(uint32_t *payload, uint32_t payload_size)
 	return 0;
 }
 
+static bool afe_token_is_valid(uint32_t token)
+{
+	if (token >= AFE_MAX_PORTS) {
+		pr_err("%s: token %d is invalid.\n", __func__, token);
+		return false;
+	}
+	return true;
+}
+
 static int32_t afe_callback(struct apr_client_data *data, void *priv)
 {
 	if (!data) {
@@ -356,6 +365,16 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 			return -EINVAL;
 		}
 
+		if (rtac_make_afe_callback(data->payload,
+					   data->payload_size))
+			return 0;
+
+		if (data->payload_size < 3 * sizeof(uint32_t)) {
+			pr_err("%s: Error: size %d is less than expected\n",
+				__func__, data->payload_size);
+			return -EINVAL;
+		}
+
 		if (payload[2] == AFE_PARAM_ID_DEV_TIMING_STATS) {
 			av_dev_drift_afe_cb_handler(data->payload,
 						    data->payload_size);
@@ -365,21 +384,26 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 					       data->payload_size))
 				return 0;
 #endif
-			if (rtac_make_afe_callback(data->payload,
-						   data->payload_size))
-				return 0;
 
 			if (sp_make_afe_callback(data->payload,
 						 data->payload_size))
 				return -EINVAL;
 		}
-		wake_up(&this_afe.wait[data->token]);
+		if (afe_token_is_valid(data->token))
+			wake_up(&this_afe.wait[data->token]);
+		else
+			return -EINVAL;
 	} else if (data->payload_size) {
 		uint32_t *payload;
 		uint16_t port_id = 0;
 
 		payload = data->payload;
 		if (data->opcode == APR_BASIC_RSP_RESULT) {
+			if (data->payload_size < (2 * sizeof(uint32_t))) {
+				pr_err("%s: Error: size %d is less than expected\n",
+					__func__, data->payload_size);
+				return -EINVAL;
+			}
 			pr_debug("%s:opcode = 0x%x cmd = 0x%x status = 0x%x token=%d\n",
 				__func__, data->opcode,
 				payload[0], payload[1], data->token);
@@ -404,7 +428,10 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 			case AFE_PORTS_CMD_DTMF_CTL:
 			case AFE_SVC_CMD_SET_PARAM:
 				atomic_set(&this_afe.state, 0);
-				wake_up(&this_afe.wait[data->token]);
+				if (afe_token_is_valid(data->token))
+					wake_up(&this_afe.wait[data->token]);
+				else
+					return -EINVAL;
 				break;
 			case AFE_SERVICE_CMD_REGISTER_RT_PORT_DRIVER:
 				break;
@@ -416,7 +443,10 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 				break;
 			case AFE_CMD_ADD_TOPOLOGIES:
 				atomic_set(&this_afe.state, 0);
-				wake_up(&this_afe.wait[data->token]);
+				if (afe_token_is_valid(data->token))
+					wake_up(&this_afe.wait[data->token]);
+				else
+					return -EINVAL;
 				pr_debug("%s: AFE_CMD_ADD_TOPOLOGIES cmd 0x%x\n",
 						__func__, payload[1]);
 				break;
@@ -438,7 +468,10 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 			else
 				this_afe.mmap_handle = payload[0];
 			atomic_set(&this_afe.state, 0);
-			wake_up(&this_afe.wait[data->token]);
+			if (afe_token_is_valid(data->token))
+				wake_up(&this_afe.wait[data->token]);
+			else
+				return -EINVAL;
 		} else if (data->opcode == AFE_EVENT_RT_PROXY_PORT_STATUS) {
 			port_id = (uint16_t)(0x0000FFFF & payload[0]);
 		}
@@ -492,6 +525,7 @@ int afe_get_port_type(u16 port_id)
 	case INT_BT_A2DP_RX:
 	case INT_FM_RX:
 	case VOICE_PLAYBACK_TX:
+	case VOICE_PLAYBACK_DL_TX:
 	case VOICE2_PLAYBACK_TX:
 	case RT_PROXY_PORT_001_RX:
 	case AUDIO_PORT_ID_I2S_RX:
@@ -692,6 +726,7 @@ int afe_sizeof_cfg_cmd(u16 port_id)
 		ret_size = SIZEOF_CFG_CMD(afe_param_id_slimbus_cfg);
 		break;
 	case VOICE_PLAYBACK_TX:
+	case VOICE_PLAYBACK_DL_TX:
 	case VOICE2_PLAYBACK_TX:
 	case VOICE_RECORD_RX:
 	case VOICE_RECORD_TX:
@@ -1300,7 +1335,10 @@ static int afe_send_hw_delay(u16 port_id, u32 rate)
 
 	memset(&delay_entry, 0, sizeof(delay_entry));
 	delay_entry.sample_rate = rate;
-	if (afe_get_port_type(port_id) == MSM_AFE_PORT_TYPE_TX)
+	if (msm_pcm_routing_is_flick_port(port_id)) {
+		delay_entry.delay_usec = 0;
+		ret = 0;
+	} else if (afe_get_port_type(port_id) == MSM_AFE_PORT_TYPE_TX)
 		ret = afe_get_cal_hw_delay(TX_DEVICE, &delay_entry);
 	else if (afe_get_port_type(port_id) == MSM_AFE_PORT_TYPE_RX)
 		ret = afe_get_cal_hw_delay(RX_DEVICE, &delay_entry);
@@ -1427,6 +1465,10 @@ static int afe_get_cal_topology_id(u16 port_id, u32 *topology_id,
 		pr_err("%s: topology_id is NULL\n", __func__);
 		return -EINVAL;
 	}
+
+	if (msm_pcm_routing_is_flick_port(port_id))
+		return ret;
+
 	*topology_id = 0;
 
 	mutex_lock(&this_afe.cal_data[cal_type_index]->lock);
@@ -1660,6 +1702,9 @@ void afe_send_cal(u16 port_id)
 	int ret;
 
 	pr_debug("%s: port_id=0x%x\n", __func__, port_id);
+
+	if (msm_pcm_routing_is_flick_port(port_id))
+		return;
 
 	if (afe_get_port_type(port_id) == MSM_AFE_PORT_TYPE_TX) {
 		afe_send_cal_spkr_prot_tx(port_id);
@@ -3021,7 +3066,7 @@ static int q6afe_send_enc_config(u16 port_id,
 				 union afe_enc_config_data *cfg, u32 format,
 				 union afe_port_config afe_config,
 				 u16 afe_in_channels, u16 afe_in_bit_width,
-				 u32 scrambler_mode)
+				 u32 scrambler_mode, u32 mono_mode)
 {
 	struct afe_audioif_config_command config;
 	int index;
@@ -3177,8 +3222,22 @@ static int q6afe_send_enc_config(u16 port_id,
 		goto exit;
 	}
 
+	if (format == ASM_MEDIA_FMT_APTX) {
+		config.param.payload_size =
+			payload_size + sizeof(config.port.channel_mode_param);
+		pr_debug("%s:sending CAPI_V2_PARAM_ID_APTX_ENC_SWITCH_TO_MONO mode= %d to DSP payload\n",
+			__func__, mono_mode);
+		config.pdata.param_id = CAPI_V2_PARAM_ID_APTX_ENC_SWITCH_TO_MONO;
+		config.pdata.param_size = sizeof(config.port.channel_mode_param);
+		config.port.channel_mode_param.channel_mode = mono_mode;
+                ret = afe_apr_send_pkt(&config, &this_afe.wait[index]);
+		if (ret) {
+			pr_err("%s: CAPI_V2_PARAM_ID_APTX_ENC_SWITCH_TO_MONO for port 0x%x failed %d\n",
+				__func__, port_id, ret);
+		}
+       }
 	if (format == ASM_MEDIA_FMT_LDAC &&
-	    cfg->ldac_config.abr_config.is_abr_enabled) {
+		cfg->ldac_config.abr_config.is_abr_enabled) {
 		config.param.payload_size =
 			payload_size + sizeof(config.port.map_param);
 		pr_debug("%s:sending AFE_ENCODER_PARAM_ID_BIT_RATE_LEVEL_MAP to DSP payload = %d\n",
@@ -3251,10 +3310,61 @@ exit:
 	return ret;
 }
 
+int afe_set_tws_channel_mode(u16 port_id, u32 channel_mode)
+{
+	struct aptx_channel_mode_param_t channel_mode_param;
+	int ret = 0;
+	int index = 0;
+
+	pr_debug("%s: enter\n", __func__);
+	index = q6audio_get_port_index(port_id);
+	if (index < 0 || index >= AFE_MAX_PORTS) {
+		pr_err("%s: AFE port index[%d] invalid!\n",
+			__func__, index);
+		return -EINVAL;
+	}
+
+	ret = q6audio_validate_port(port_id);
+	if (ret < 0) {
+		pr_err("%s: port id: 0x%x ret %d\n", __func__, port_id, ret);
+		return -EINVAL;
+	}
+
+	channel_mode_param.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+					APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
+	channel_mode_param.hdr.pkt_size = sizeof(channel_mode_param);
+	channel_mode_param.hdr.src_port = 0;
+	channel_mode_param.hdr.dest_port = 0;
+	channel_mode_param.hdr.token = index;
+
+	channel_mode_param.hdr.opcode = AFE_PORT_CMD_SET_PARAM_V2;
+	channel_mode_param.param.payload_size = sizeof(channel_mode_param) - sizeof(struct apr_hdr)
+						- sizeof(channel_mode_param.param);
+
+	channel_mode_param.param.payload_address_lsw = 0x00;
+	channel_mode_param.param.payload_address_msw = 0x00;
+	channel_mode_param.param.mem_map_handle = 0x00;
+	channel_mode_param.param.port_id = q6audio_get_port_id(port_id);
+	channel_mode_param.pdata.module_id = AFE_MODULE_ID_ENCODER;
+	channel_mode_param.pdata.param_id = CAPI_V2_PARAM_ID_APTX_ENC_SWITCH_TO_MONO;
+	channel_mode_param.pdata.param_size =  sizeof(channel_mode_param.channel_mode);
+
+	channel_mode_param.channel_mode = channel_mode;
+
+	ret = afe_apr_send_pkt(&channel_mode_param, &this_afe.wait[index]);
+
+	if (ret)
+		pr_err("%s: AFE set channel mode cfg for port 0x%x failed %d\n",
+			__func__, port_id, ret);
+
+	return ret;
+}
+EXPORT_SYMBOL(afe_set_tws_channel_mode);
+
 static int __afe_port_start(u16 port_id, union afe_port_config *afe_config,
 			    u32 rate, u16 afe_in_channels, u16 afe_in_bit_width,
 			    union afe_enc_config_data *enc_cfg,
-			    u32 codec_format, u32 scrambler_mode,
+			    u32 codec_format, u32 scrambler_mode, u32 mono_mode,
 			    struct afe_dec_config *dec_cfg)
 {
 	struct afe_audioif_config_command config;
@@ -3449,6 +3559,7 @@ static int __afe_port_start(u16 port_id, union afe_port_config *afe_config,
 		cfg_type = AFE_PARAM_ID_HDMI_CONFIG;
 		break;
 	case VOICE_PLAYBACK_TX:
+	case VOICE_PLAYBACK_DL_TX:
 	case VOICE2_PLAYBACK_TX:
 	case VOICE_RECORD_RX:
 	case VOICE_RECORD_TX:
@@ -3528,7 +3639,7 @@ static int __afe_port_start(u16 port_id, union afe_port_config *afe_config,
 						    codec_format, *afe_config,
 						    afe_in_channels,
 						    afe_in_bit_width,
-						    scrambler_mode);
+						    scrambler_mode, mono_mode);
 			if (ret) {
 				pr_err("%s: AFE encoder config for port 0x%x failed %d\n",
 					__func__, port_id, ret);
@@ -3602,7 +3713,7 @@ int afe_port_start(u16 port_id, union afe_port_config *afe_config,
 		   u32 rate)
 {
 	return __afe_port_start(port_id, afe_config, rate,
-				0, 0, NULL, ASM_MEDIA_FMT_NONE, 0, NULL);
+				0, 0, NULL, ASM_MEDIA_FMT_NONE, 0, 0, NULL);
 }
 EXPORT_SYMBOL(afe_port_start);
 
@@ -3631,11 +3742,12 @@ int afe_port_start_v2(u16 port_id, union afe_port_config *afe_config,
 		ret = __afe_port_start(port_id, afe_config, rate,
 					afe_in_channels, afe_in_bit_width,
 					&enc_cfg->data, enc_cfg->format,
-					enc_cfg->scrambler_mode, dec_cfg);
+					enc_cfg->scrambler_mode,
+					enc_cfg->mono_mode, dec_cfg);
 	else if (dec_cfg != NULL)
 		ret = __afe_port_start(port_id, afe_config, rate,
 					afe_in_channels, afe_in_bit_width,
-					NULL, dec_cfg->format, 0, dec_cfg);
+					NULL, dec_cfg->format, 0, 0, dec_cfg);
 
 	return ret;
 }
@@ -3679,6 +3791,7 @@ int afe_get_port_index(u16 port_id)
 	case VOICE_RECORD_RX: return IDX_VOICE_RECORD_RX;
 	case VOICE_RECORD_TX: return IDX_VOICE_RECORD_TX;
 	case VOICE_PLAYBACK_TX: return IDX_VOICE_PLAYBACK_TX;
+	case VOICE_PLAYBACK_DL_TX: return IDX_VOICE_RECORD_RX;
 	case VOICE2_PLAYBACK_TX: return IDX_VOICE2_PLAYBACK_TX;
 	case SLIMBUS_0_RX: return IDX_SLIMBUS_0_RX;
 	case SLIMBUS_0_TX: return IDX_SLIMBUS_0_TX;
@@ -5694,6 +5807,7 @@ int afe_validate_port(u16 port_id)
 	case VOICE_RECORD_RX:
 	case VOICE_RECORD_TX:
 	case VOICE_PLAYBACK_TX:
+	case VOICE_PLAYBACK_DL_TX:
 	case VOICE2_PLAYBACK_TX:
 	case SLIMBUS_0_RX:
 	case SLIMBUS_0_TX:
@@ -5702,6 +5816,7 @@ int afe_validate_port(u16 port_id)
 	case SLIMBUS_2_RX:
 	case SLIMBUS_2_TX:
 	case SLIMBUS_3_RX:
+	case SLIMBUS_3_TX:
 	case INT_BT_SCO_RX:
 	case INT_BT_SCO_TX:
 	case INT_BT_A2DP_RX:

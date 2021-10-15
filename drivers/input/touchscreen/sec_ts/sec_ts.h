@@ -22,6 +22,7 @@
 #include <linux/hrtimer.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
+#include <linux/input/heatmap.h>
 #include <linux/input/mt.h>
 #include <linux/input/sec_cmd.h>
 #include <linux/interrupt.h>
@@ -125,7 +126,8 @@
 #define SEC_TS_FW_HEADER_SIGN		0x53494654
 #define SEC_TS_FW_CHUNK_SIGN		0x53434654
 
-#define SEC_TS_FW_UPDATE_ON_PROBE
+#undef SEC_TS_FW_UPDATE_ON_PROBE
+#define SEC_TS_FW_UPDATE_DELAY_MS_AFTER_PROBE	1000
 
 #define AMBIENT_CAL			0
 #define OFFSET_CAL_SDC			1
@@ -197,6 +199,8 @@
 #define SEC_TS_CMD_ERASE_FLASH			0x45
 #define SEC_TS_CMD_RESET_BASELINE		0x47
 #define SEC_TS_CMD_WRITE_NORM_TABLE		0x49
+#define SEC_TS_CMD_HEATMAP_READ			0x4A
+#define SEC_TS_CMD_HEATMAP_ENABLE		0x4B
 #define SEC_TS_READ_ID				0x52
 #define SEC_TS_READ_BOOT_STATUS			0x55
 #define SEC_TS_CMD_ENTER_FW_MODE		0x57
@@ -550,6 +554,19 @@ enum tsp_hw_parameter {
 	TSP_MODULE_ID		= 6,
 };
 
+/* Local heatmap */
+#define LOCAL_HEATMAP_WIDTH 7
+#define LOCAL_HEATMAP_HEIGHT 7
+
+struct heatmap_report {
+	int8_t offset_x;
+	uint8_t size_x;
+	int8_t offset_y;
+	uint8_t size_y;
+	/* data is in BE order; order should be enforced after data is read */
+	strength_t data[LOCAL_HEATMAP_WIDTH * LOCAL_HEATMAP_HEIGHT];
+} __attribute__((packed));
+
 #define TEST_MODE_MIN_MAX		false
 #define TEST_MODE_ALL_NODE		true
 #define TEST_MODE_READ_FRAME		false
@@ -685,6 +702,9 @@ struct sec_ts_data {
 	struct sec_ts_plat_data *plat_data;
 	struct sec_ts_coordinate coord[MAX_SUPPORT_TOUCH_COUNT + MAX_SUPPORT_HOVER_COUNT];
 
+	ktime_t timestamp; /* time that the event was first received from the
+		touch IC, acquired during hard interrupt, in CLOCK_MONOTONIC */
+
 	struct timeval time_pressed[MAX_SUPPORT_TOUCH_COUNT + MAX_SUPPORT_HOVER_COUNT];
 	struct timeval time_released[MAX_SUPPORT_TOUCH_COUNT + MAX_SUPPORT_HOVER_COUNT];
 	long time_longest;
@@ -724,14 +744,23 @@ struct sec_ts_data {
 
 	struct pm_qos_request pm_qos_req;
 
-	struct delayed_work work_read_info;
+	struct v4l2_heatmap v4l2;
+
 #ifdef USE_POWER_RESET_WORK
 	struct delayed_work reset_work;
 	volatile bool reset_is_on_going;
 #endif
-	struct work_struct work_fw_update;
+
+#ifdef SEC_TS_FW_UPDATE_ON_PROBE
+	struct work_struct fw_update_work;
+#else
+	struct delayed_work fw_update_work;
+	struct workqueue_struct *fw_update_wq;
+#endif
 	struct work_struct suspend_work;
 	struct work_struct resume_work;
+	struct workqueue_struct *event_wq;	/* Used for event handler,
+						 * suspend, resume threads */
 	struct completion resume_done;
 	struct sec_cmd_data sec;
 	short *pFrame;
@@ -871,6 +900,7 @@ struct sec_ts_plat_data {
 	int tsp_id;
 	int tsp_vsync;
 	int switch_gpio;
+	int reset_gpio;
 
 	bool regulator_boot_on;
 	bool support_mt_pressure;
@@ -880,13 +910,17 @@ struct sec_ts_plat_data {
 
 int sec_ts_stop_device(struct sec_ts_data *ts);
 int sec_ts_start_device(struct sec_ts_data *ts);
+int sec_ts_hw_reset(struct sec_ts_data *ts);
 int sec_ts_sw_reset(struct sec_ts_data *ts);
+int sec_ts_system_reset(struct sec_ts_data *ts);
 int sec_ts_set_lowpowermode(struct sec_ts_data *ts, u8 mode);
 int sec_ts_firmware_update_on_probe(struct sec_ts_data *ts, bool force_update);
 int sec_ts_firmware_update_on_hidden_menu(struct sec_ts_data *ts, int update_type);
 int sec_ts_glove_mode_enables(struct sec_ts_data *ts, int mode);
 int sec_ts_set_cover_type(struct sec_ts_data *ts, bool enable);
 int sec_ts_wait_for_ready(struct sec_ts_data *ts, unsigned int ack);
+int sec_ts_wait_for_ready_with_count(struct sec_ts_data *ts, unsigned int ack,
+				     unsigned int count);
 int sec_ts_try_wake(struct sec_ts_data *ts, bool wake_setting);
 int sec_ts_set_bus_ref(struct sec_ts_data *ts, u16 ref, bool enable);
 

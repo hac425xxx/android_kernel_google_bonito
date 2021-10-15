@@ -414,6 +414,7 @@ enum {
 	EXT_EC_REF_QUAT_MI2S_TX,
 	EXT_EC_REF_QUIN_MI2S_TX,
 	EXT_EC_REF_SLIM_1_TX,
+	EXT_EC_REF_QUAT_TDM_RX_0,
 };
 
 #define INVALID_SESSION -1
@@ -523,4 +524,6 @@ int msm_pcm_routing_reg_stream_app_type_cfg(
 int msm_pcm_routing_get_stream_app_type_cfg(
 	int fedai_id, int session_type, int *be_id,
 	struct msm_pcm_stream_app_type_cfg *cfg_data);
+
+int msm_pcm_routing_is_flick_port(int port_id);
 #endif /*_MSM_PCM_H*/
