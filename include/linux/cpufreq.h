@@ -120,15 +120,6 @@ struct cpufreq_policy {
 	bool			fast_switch_possible;
 	bool			fast_switch_enabled;
 
-	/*
-	 * Remote DVFS flag (Not added to the driver structure as we don't want
-	 * to access another structure from scheduler hotpath).
-	 *
-	 * Should be set if CPUs can do DVFS on behalf of other CPUs from
-	 * different cpufreq policies.
-	 */
-	bool			dvfs_possible_from_any_cpu;
-
 	 /* Cached frequency lookup from cpufreq_driver_resolve_freq. */
 	unsigned int cached_target_freq;
 	int cached_resolved_idx;
@@ -425,7 +416,6 @@ static inline void cpufreq_resume(void) {}
 #define CPUFREQ_START			(2)
 #define CPUFREQ_CREATE_POLICY		(3)
 #define CPUFREQ_REMOVE_POLICY		(4)
-#define CPUFREQ_STOP			(5)
 
 /* Govinfo Notifiers */
 #define CPUFREQ_LOAD_CHANGE		(0)
@@ -556,19 +546,6 @@ static inline void cpufreq_policy_apply_limits(struct cpufreq_policy *policy)
 		__cpufreq_driver_target(policy, policy->min, CPUFREQ_RELATION_L);
 }
 
-static inline unsigned int
-cpufreq_policy_apply_limits_fast(struct cpufreq_policy *policy)
-{
-	unsigned int ret = 0;
-
-	if (policy->max < policy->cur)
-		ret = cpufreq_driver_fast_switch(policy, policy->max);
-	else if (policy->min > policy->cur)
-		ret = cpufreq_driver_fast_switch(policy, policy->min);
-
-	return ret;
-}
-
 /* Governor attribute set */
 struct gov_attr_set {
 	struct kobject kobj;
@@ -620,17 +597,6 @@ extern struct cpufreq_governor cpufreq_gov_interactive;
 extern struct cpufreq_governor cpufreq_gov_sched;
 #define CPUFREQ_DEFAULT_GOVERNOR	(&cpufreq_gov_sched)
 #endif
-
-static inline bool cpufreq_can_do_remote_dvfs(struct cpufreq_policy *policy)
-{
-	/*
-	 * Allow remote callbacks if:
-	 * - dvfs_possible_from_any_cpu flag is set
-	 * - the local and remote CPUs share cpufreq policy
-	 */
-	return policy->dvfs_possible_from_any_cpu ||
-		cpumask_test_cpu(smp_processor_id(), policy->cpus);
-}
 
 /*********************************************************************
  *                     FREQUENCY TABLE HELPERS                       *
@@ -964,9 +930,7 @@ unsigned int cpufreq_generic_get(unsigned int cpu);
 int cpufreq_generic_init(struct cpufreq_policy *policy,
 		struct cpufreq_frequency_table *table,
 		unsigned int transition_latency);
-#define arch_set_freq_scale scale_freq_capacity
-void scale_freq_capacity(const cpumask_t *cpus, unsigned long cur_freq,
-			 unsigned long max_freq);
+
 struct sched_domain;
 unsigned long cpufreq_scale_freq_capacity(struct sched_domain *sd, int cpu);
 unsigned long cpufreq_scale_max_freq_capacity(struct sched_domain *sd, int cpu);

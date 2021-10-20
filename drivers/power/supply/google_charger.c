@@ -776,7 +776,7 @@ static void bd_work(struct work_struct *work)
 			pr_info("MSC_BD_WORK: done time=%lld limit=%d, temp=%d limit=%d\n",
 				delta_time, bd_state->bd_resume_time,
 				temp, bd_state->bd_resume_temp);
-			bd_state->triggered = triggered;
+			bd_reset(bd_state);
 			goto bd_rerun;
 		}
 	}
@@ -807,6 +807,7 @@ static void chg_work(struct work_struct *work)
 	struct chg_drv *chg_drv =
 	    container_of(work, struct chg_drv, chg_work.work);
 	struct chg_profile *profile = &chg_drv->chg_profile;
+	union power_supply_propval val;
 	struct power_supply *chg_psy = chg_drv->chg_psy;
 	struct power_supply *usb_psy = chg_drv->usb_psy;
 	struct power_supply *wlc_psy = chg_drv->wlc_psy;
@@ -821,6 +822,7 @@ static void chg_work(struct work_struct *work)
 	int disable_pwrsrc = 0;
 	int rc;
 	static bool cable_in;
+	bool plug_status_changed = false;
 
 	__pm_stay_awake(&chg_drv->chg_ws);
 	pr_debug("battery charging work item\n");
@@ -834,14 +836,17 @@ static void chg_work(struct work_struct *work)
 		int ret = 0;
 
 		/* only after boot */
-		if (chg_drv->plugged != -1) {
+		if (chg_drv->plugged != -1 &&
+		    strncmp(chg_drv->bat_psy_name, "bms", 3) != 0) {
 			ret = PSY_SET_PROP(bat_psy,
 					   POWER_SUPPLY_PROP_BATT_CE_CTRL,
 					   plugged);
 		}
 
-		if (ret == 0)
+		if (ret == 0) {
+			plug_status_changed = true;
 			chg_drv->plugged = plugged;
+		}
 	}
 
 	/* If no power source, disable charging and exit */
@@ -849,7 +854,7 @@ static void chg_work(struct work_struct *work)
 		const bool stop_charging = chg_drv->stop_charging != 1;
 		struct bd_data *bd_state = &chg_drv->bd_state;
 
-		if (stop_charging) {
+		if (stop_charging || plug_status_changed) {
 			pr_info("no power source detected, disabling charging\n");
 			if (!bd_state->triggered)
 				bd_reset(bd_state);
@@ -1339,7 +1344,7 @@ static void chg_work(struct work_struct *work)
 		pr_err("chg_work charging status UNKNOWN\n");
 		goto error_rerun;
 	default:
-		pr_err("chg_work invalid charging status %d\n", batt_status);
+		pr_err("chg_work invalid charging status %d\n", val.intval);
 		goto error_rerun;
 	}
 
@@ -2117,6 +2122,41 @@ static ssize_t set_bd_resume_soc(struct device *dev,
 }
 static DEVICE_ATTR(bd_resume_soc, 0660, show_bd_resume_soc, set_bd_resume_soc);
 
+static ssize_t bd_clear_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct chg_drv *chg_drv = dev_get_drvdata(dev);
+	int ret = 0, val = 0;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	if (!val)
+		return ret;
+
+	mutex_lock(&chg_drv->bd_lock);
+
+	ret = bd_batt_set_state(chg_drv, false, -1);
+	if (ret < 0)
+		pr_err("MSC_BD set_batt_state (%d)\n", ret);
+
+	bd_reset(&chg_drv->bd_state);
+
+	if (chg_drv->chg_psy)
+		power_supply_changed(chg_drv->chg_psy);
+
+	mutex_unlock(&chg_drv->bd_lock);
+
+	if (chg_drv->bat_psy)
+		power_supply_changed(chg_drv->bat_psy);
+
+	return count;
+}
+
+static DEVICE_ATTR_WO(bd_clear);
+
 #ifdef CONFIG_DEBUG_FS
 
 /* use qcom VS maxim fg and more... */
@@ -2450,6 +2490,12 @@ static int google_charger_probe(struct platform_device *pdev)
 	if (ret != 0) {
 		pr_err("Failed to create bd_resume_soc files, ret=%d\n",
 		       ret);
+		return ret;
+	}
+
+	ret = device_create_file(chg_drv->device, &dev_attr_bd_clear);
+	if (ret != 0) {
+		pr_err("Failed to create bd_clear files, ret=%d\n", ret);
 		return ret;
 	}
 

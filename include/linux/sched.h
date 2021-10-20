@@ -154,12 +154,20 @@ extern u64 nr_running_integral(unsigned int cpu);
 
 #ifdef CONFIG_SMP
 extern void sched_update_nr_prod(int cpu, long delta, bool inc);
+extern void sched_get_nr_running_avg(int *avg, int *iowait_avg, int *big_avg,
+				     unsigned int *max_nr,
+				     unsigned int *big_max_nr);
 extern unsigned int sched_get_cpu_util(int cpu);
 extern u64 sched_get_cpu_last_busy_time(int cpu);
 extern u32 sched_get_wake_up_idle(struct task_struct *p);
 extern int sched_set_wake_up_idle(struct task_struct *p, int wake_up_idle);
 #else
 static inline void sched_update_nr_prod(int cpu, long delta, bool inc)
+{
+}
+static inline void sched_get_nr_running_avg(int *avg, int *iowait_avg,
+				int *big_avg, unsigned int *max_nr,
+				unsigned int *big_max_nr)
 {
 }
 static inline unsigned int sched_get_cpu_util(int cpu)
@@ -357,7 +365,7 @@ extern int lockdep_tasklist_lock_is_held(void);
 extern void sched_init(void);
 extern void sched_init_smp(void);
 extern asmlinkage void schedule_tail(struct task_struct *prev);
-extern void init_idle(struct task_struct *idle, int cpu);
+extern void init_idle(struct task_struct *idle, int cpu, bool hotplug);
 extern void init_idle_bootup_task(struct task_struct *idle);
 
 extern cpumask_var_t cpu_isolated_map;
@@ -1296,10 +1304,10 @@ const struct sched_group_energy * const(*sched_domain_energy_f)(int cpu);
 #define SDTL_OVERLAP	0x01
 
 struct sd_data {
-	struct sched_domain *__percpu *sd;
-	struct sched_domain_shared *__percpu *sds;
-	struct sched_group *__percpu *sg;
-	struct sched_group_capacity *__percpu *sgc;
+	struct sched_domain **__percpu sd;
+	struct sched_domain_shared **__percpu sds;
+	struct sched_group **__percpu sg;
+	struct sched_group_capacity **__percpu sgc;
 };
 
 struct sched_domain_topology_level {
@@ -1517,8 +1525,6 @@ struct ravg {
 	 *
 	 * 'busy_buckets' groups historical busy time into different buckets
 	 * used for prediction
-	 *
-	 * 'demand_scaled' represents task's demand scaled to 1024
 	 */
 	u64 mark_start;
 	u32 sum, demand;
@@ -1529,8 +1535,6 @@ struct ravg {
 	u16 active_windows;
 	u32 pred_demand;
 	u8 busy_buckets[NUM_BUSY_BUCKETS];
-	u16 demand_scaled;
-	u16 pred_demand_scaled;
 };
 
 struct sched_entity {
@@ -1705,6 +1709,7 @@ struct task_struct {
 	struct sched_entity se;
 	struct sched_rt_entity rt;
 	u64 last_sleep_ts;
+	u64 last_cpu_deselected_ts;
 #ifdef CONFIG_SCHED_WALT
 	struct ravg ravg;
 	/*
@@ -1713,6 +1718,7 @@ struct task_struct {
 	 */
 	u32 init_load_pct;
 	u64 last_wake_ts;
+	u64 last_switch_out_ts;
 	u64 last_enqueued_ts;
 	struct related_thread_group *grp;
 	struct list_head grp_list;
@@ -1737,7 +1743,6 @@ struct task_struct {
 	unsigned int policy;
 	int nr_cpus_allowed;
 	cpumask_t cpus_allowed;
-	cpumask_t cpus_requested;
 
 #ifdef CONFIG_PREEMPT_RCU
 	int rcu_read_lock_nesting;
@@ -2038,6 +2043,8 @@ struct task_struct {
 #endif
 	struct list_head pi_state_list;
 	struct futex_pi_state *pi_state_cache;
+	struct mutex futex_exit_mutex;
+	unsigned int futex_state;
 #endif
 #ifdef CONFIG_PERF_EVENTS
 	struct perf_event_context *perf_event_ctxp[perf_nr_task_contexts];
@@ -2500,7 +2507,6 @@ extern void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, 
  */
 #define PF_WAKE_UP_IDLE 0x00000002	/* try to wake up on an idle CPU */
 #define PF_EXITING	0x00000004	/* getting shut down */
-#define PF_EXITPIDONE	0x00000008	/* pi exit done on shut down */
 #define PF_VCPU		0x00000010	/* I'm a virtual CPU */
 #define PF_WQ_WORKER	0x00000020	/* I'm a workqueue worker */
 #define PF_FORKNOEXEC	0x00000040	/* forked but didn't exec */
@@ -3255,8 +3261,10 @@ extern struct mm_struct *get_task_mm(struct task_struct *task);
  * succeeds.
  */
 extern struct mm_struct *mm_access(struct task_struct *task, unsigned int mode);
-/* Remove the current tasks stale references to the old mm_struct */
-extern void mm_release(struct task_struct *, struct mm_struct *);
+/* Remove the current tasks stale references to the old mm_struct on exit() */
+extern void exit_mm_release(struct task_struct *, struct mm_struct *);
+/* Remove the current tasks stale references to the old mm_struct on exec() */
+extern void exec_mm_release(struct task_struct *, struct mm_struct *);
 
 #ifdef CONFIG_HAVE_COPY_THREAD_TLS
 extern int copy_thread_tls(unsigned long, unsigned long, unsigned long,
