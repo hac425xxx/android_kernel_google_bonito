@@ -28,11 +28,77 @@
 #include "dsi_display.h"
 #include "dsi_panel.h"
 
+#ifdef CONFIG_KLAPSE
+#include <linux/klapse.h>
+#endif
+
 #define BL_NODE_NAME_SIZE 32
 
 #define BL_STATE_STANDBY	BL_CORE_FBBLANK
 #define BL_STATE_LP		BL_CORE_DRIVER1
 #define BL_STATE_LP2		BL_CORE_DRIVER2
+#define BL_HBM 			1023
+
+bool backlight_dimmer = 0;
+module_param(backlight_dimmer, bool, 0644);
+
+static int hbm_enable = 0;
+static struct dsi_backlight_config *bl_g;
+static struct device *fb0_device;
+
+static void enable_hbm(int enable)
+{
+	struct dsi_panel *panel = container_of(bl_g, struct dsi_panel, bl_config);
+	struct hbm_data *hbm = bl_g->hbm;
+	struct hbm_range *range = NULL;
+	u32 target_range = enable ? bl_g->hbm->num_ranges - 1 : 0;
+	range = hbm->ranges + target_range;
+
+	if (dsi_backlight_get_dpms(&panel->bl_config) == SDE_MODE_DPMS_ON) {
+		if(dsi_panel_cmd_set_transfer(panel, enable ? &range->entry_cmd : &range->dimming_stop_cmd))
+			pr_err("Failed to send command for range %d\n",	enable);
+	}
+}
+
+static ssize_t hbm_show(struct device *device, struct device_attribute *attr,
+		      char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", hbm_enable);
+}
+
+static ssize_t hbm_store(struct device *device, struct device_attribute *attr,
+		       const char *buf, size_t count)
+{
+	int ret, val;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	if (val < 0 || val > 1)
+		val = 0;
+
+	hbm_enable = val;
+	enable_hbm(hbm_enable);
+	backlight_update_status(bl_g->bl_device);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(hbm);
+
+static void fb0_init_device(struct dsi_backlight_config *bl)
+{
+	bl_g = bl;
+	fb0_device = device_create(fb_class, NULL, MKDEV(0, 0), NULL, "fb0");
+	if (IS_ERR(fb0_device)) {
+		fb0_device = NULL;
+		return;
+	}
+
+	if (device_create_file(fb0_device, &dev_attr_hbm))
+		pr_warn("unable to create hbm node\n");
+}
 
 struct dsi_backlight_pwm_config {
 	bool pwm_pmi_control;
@@ -135,7 +201,7 @@ static u32 dsi_backlight_calculate_normal(struct dsi_backlight_config *bl,
 		/* map UI brightness into driver backlight level rounding it */
 		rc = dsi_backlight_lerp(
 			1, bl->brightness_max_level,
-			bl->bl_min_level ? : 1, bl->bl_max_level,
+			backlight_dimmer ? 1 : bl->bl_min_level, bl->bl_max_level,
 			brightness, &bl_lvl);
 		if (unlikely(rc))
 			pr_err("failed to linearly interpolate, brightness unmodified\n");
@@ -385,6 +451,10 @@ static u32 dsi_backlight_calculate(struct dsi_backlight_config *bl,
 	bl_temp = mult_frac(bl_temp, bl->bl_scale_ad,
 			MAX_AD_BL_SCALE_LEVEL);
 
+	if (hbm_enable) {
+		return BL_HBM;
+	}
+
 	if (panel->hbm_mode)
 		bl_lvl = dsi_backlight_calculate_hbm(bl, bl_temp);
 	else
@@ -393,6 +463,10 @@ static u32 dsi_backlight_calculate(struct dsi_backlight_config *bl,
 	pr_debug("brightness=%d, bl_scale=%d, ad=%d, bl_lvl=%d, hbm = %d\n",
 			brightness, bl->bl_scale, bl->bl_scale_ad, bl_lvl,
 			panel->hbm_mode);
+
+#ifdef CONFIG_KLAPSE
+	set_rgb_slider(bl_lvl);
+#endif
 
 	return bl_lvl;
 }
@@ -710,6 +784,9 @@ static int dsi_backlight_register(struct dsi_backlight_config *bl)
 
 	if (sysfs_create_groups(&bl->bl_device->dev.kobj, bl_device_groups))
 		pr_warn("unable to create device groups\n");
+
+	//make dummy fb0 device so we have the old standard hbm sysfs path
+	fb0_init_device(bl);
 
 	reg = regulator_get(panel->parent, "lab");
 	if (!PTR_ERR_OR_ZERO(reg)) {

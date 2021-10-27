@@ -263,7 +263,6 @@ kgsl_mem_entry_create(void)
 		kref_init(&entry->refcount);
 		/* put this ref in userspace memory alloc and map ioctls */
 		kref_get(&entry->refcount);
-		atomic_set(&entry->map_count, 0);
 	}
 
 	atomic_set(&entry->map_count, 0);
@@ -274,7 +273,7 @@ static void kgsl_destroy_ion(struct kgsl_dma_buf_meta *meta)
 {
 	if (meta != NULL) {
 		dma_buf_unmap_attachment(meta->attach, meta->table,
-			DMA_BIDIRECTIONAL);
+			DMA_FROM_DEVICE);
 		dma_buf_detach(meta->dmabuf, meta->attach);
 		dma_buf_put(meta->dmabuf);
 		kfree(meta);
@@ -2589,7 +2588,7 @@ static int kgsl_setup_dma_buf(struct kgsl_device *device,
 	entry->memdesc.flags &= ~((uint64_t) KGSL_MEMFLAGS_USE_CPU_MAP);
 	entry->memdesc.flags |= (uint64_t)KGSL_MEMFLAGS_USERMEM_ION;
 
-	sg_table = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
+	sg_table = dma_buf_map_attachment(attach, DMA_TO_DEVICE);
 
 	if (IS_ERR_OR_NULL(sg_table)) {
 		ret = PTR_ERR(sg_table);
@@ -4843,12 +4842,6 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 	if (status)
 		goto error_close_mmu;
 
-	/* Allocate memory for dma_parms and set the max_seg_size */
-	device->dev->dma_parms =
-		kzalloc(sizeof(*device->dev->dma_parms), GFP_KERNEL);
-
-	dma_set_max_seg_size(device->dev, KGSL_DMA_BIT_MASK);
-
 	/* Initialize the memory pools */
 	kgsl_init_page_pools(device->pdev);
 
@@ -4918,9 +4911,6 @@ void kgsl_device_platform_remove(struct kgsl_device *device)
 {
 	destroy_workqueue(device->events_wq);
 
-	kfree(device->dev->dma_parms);
-	device->dev->dma_parms = NULL;
-
 	kgsl_device_snapshot_close(device);
 
 	kgsl_exit_page_pools();
@@ -4974,7 +4964,7 @@ static void kgsl_core_exit(void)
 static int __init kgsl_core_init(void)
 {
 	int result = 0;
-	struct sched_param param = { .sched_priority = 2 };
+	struct sched_param param = { .sched_priority = 6 };
 
 	/* alloc major and minor device numbers */
 	result = alloc_chrdev_region(&kgsl_driver.major, 0, KGSL_DEVICE_MAX,
@@ -5037,7 +5027,7 @@ static int __init kgsl_core_init(void)
 	INIT_LIST_HEAD(&kgsl_driver.pagetable_list);
 
 	kgsl_driver.workqueue = alloc_workqueue("kgsl-workqueue",
-		WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS, 0);
+		WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS, 0);
 
 	kgsl_driver.mem_workqueue = alloc_workqueue("kgsl-mementry",
 		WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
