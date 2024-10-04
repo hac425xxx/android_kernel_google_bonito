@@ -2,3 +2,9 @@ kali nethunter kernel for Pixel3a:
 add rtl88xx driver.
 add mkdtimg binary to tools dir.
 patch support usb eth and usb serial.
+
+
+kernel for android12
+
+ref:
+https://xdaforums.com/t/kernel-kali-nethunter-kernel-pixel-3a-and-3a-xl-sargo-bonito-kernel.4319283/
