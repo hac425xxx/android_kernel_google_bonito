@@ -1121,6 +1121,35 @@ enum mac80211_rx_flags {
 #define RX_FLAG_STBC_SHIFT		26
 
 /**
+ * enum mac80211_rx_encoding_flags - MCS & bandwidth flags
+ *
+ * @RX_ENC_FLAG_SHORTPRE: Short preamble was used for this frame
+ * @RX_ENC_FLAG_SHORT_GI: Short guard interval was used
+ * @RX_ENC_FLAG_HT_GF: This frame was received in a HT-greenfield transmission,
+ *	if the driver fills this value it should add
+ *	%IEEE80211_RADIOTAP_MCS_HAVE_FMT
+ *	to hw.radiotap_mcs_details to advertise that fact
+ * @RX_ENC_FLAG_LDPC: LDPC was used
+ * @RX_ENC_FLAG_STBC_MASK: STBC 2 bit bitmask. 1 - Nss=1, 2 - Nss=2, 3 - Nss=3
+ * @RX_ENC_FLAG_BF: packet was beamformed
+ */
+enum mac80211_rx_encoding_flags {
+	RX_ENC_FLAG_SHORTPRE		= BIT(0),
+	RX_ENC_FLAG_SHORT_GI		= BIT(2),
+	RX_ENC_FLAG_HT_GF		= BIT(3),
+	RX_ENC_FLAG_STBC_MASK		= BIT(4) | BIT(5),
+	RX_ENC_FLAG_LDPC		= BIT(6),
+	RX_ENC_FLAG_BF			= BIT(7),
+};
+#define RX_ENC_FLAG_STBC_SHIFT		4
+enum mac80211_rx_encoding {
+	RX_ENC_LEGACY = 0,
+	RX_ENC_HT,
+	RX_ENC_VHT,
+	RX_ENC_HE,
+};
+
+/**
  * enum mac80211_rx_vht_flags - receive VHT flags
  *
  * These flags are used with the @vht_flag member of
@@ -1178,6 +1207,9 @@ struct ieee80211_rx_status {
 	u32 ampdu_reference;
 	u64 flag;
 	u16 freq;
+	u8 enc_flags;
+	u8 encoding:2, bw:3, he_ru:3;
+	u8 nss;
 	u8 vht_flag;
 	u8 rate_idx;
 	u8 vht_nss;
